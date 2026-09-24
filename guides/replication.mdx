@@ -19,7 +19,7 @@ A few properties follow from this design:
 
 ## ServerOnly Fields
 
-Wrap any root field in `Scribe.ServerOnly` to exclude it from all client diffs. The field is saved and writable on the server, but it is absent from the client's accessor type — a read attempt there is a compile-time type error, not a runtime `nil`.
+Wrap any root field in `Scribe.ServerOnly` to exclude it from all client diffs. The field is saved and writable on the server, but it is **absent from the client's accessor type** — a read attempt there is a compile-time type error, not a runtime `nil`. It is also excluded from the replication stream entirely.
 
 ```lua
 local template = {
@@ -94,13 +94,13 @@ export type ScribeTransport = {
     Name: string,
     MaxFrameBytes: number?,           -- optional: this channel's own ceiling
     -- Server side
-    SendToClient:    (self: any, player: Player, bytes: buffer) -> (),
+    SendToClient:     (self: any, player: Player, bytes: buffer) -> (),
     SendToAllClients: ((self: any, bytes: buffer) -> ())?,  -- optional broadcast
-    ListenServer:    (self: any, callback: (player: Player, bytes: buffer) -> ()) -> (),
+    ListenServer:     (self: any, callback: (player: Player, bytes: buffer) -> ()) -> (),
     -- Client side
-    SendToServer:    (self: any, bytes: buffer) -> (),
-    ListenClient:    (self: any, callback: (bytes: buffer) -> ()) -> (),
-    Release:         ((self: any) -> ())?,  -- optional: called by Data.Stop()
+    SendToServer:     (self: any, bytes: buffer) -> (),
+    ListenClient:     (self: any, callback: (bytes: buffer) -> ()) -> (),
+    Release:          ((self: any) -> ())?,  -- optional: called by Data.Stop()
 }
 ```
 
@@ -181,14 +181,15 @@ return {
 
 Scribe takes the **smaller** of `MaxOutboundBytes` and `MaxFrameBytes`, so declaring one can only narrow the budget and never widen it.
 
-## MaxOutboundBytes and MaxInboundBytes
+## Network Configuration Options
 
-Two configuration options bound the per-frame byte sizes.
+Several configuration keys control how Scribe sizes and throttles its network traffic.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `MaxOutboundBytes` | 65,536 | Maximum bytes per outbound diff frame. Larger frames are split and reassembled. |
-| `MaxInboundBytes` | derived | Coarse per-player ceiling on raw inbound frame rate; frames above the rate are dropped silently |
+| `MaxOutboundBytes` | 65,536 | Maximum bytes per outbound diff frame. Larger frames are split by the server and reassembled by the client. |
+| `MaxInboundBytes` | 8,192 | Maximum byte size of a single raw inbound frame from one client. Frames above this size are dropped silently and logged as `INBOUND_OVERSIZE`. |
+| `TransportChannel` | `"Default"` | Name of the RemoteEvent channel the default transport creates. Set a unique value for each bundle when running more than one. |
 
 ```lua
 Scribe({
@@ -196,6 +197,7 @@ Scribe({
     ProfileStoreIndex = "PlayerData",
     ProfileKeyPrefix = "PLAYER_",
     MaxOutboundBytes = 32768,   -- narrower budget for constrained channels
+    MaxInboundBytes  = 4096,    -- tighter inbound ceiling
 })
 ```
 

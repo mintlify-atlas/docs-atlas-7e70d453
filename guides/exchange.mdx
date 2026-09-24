@@ -12,7 +12,7 @@ Exchange requires both players to be online and loaded on the **same server**. F
 
 ## Declaring exchangeable paths
 
-Nothing is tradeable by default. Add an `Exchangeable` table to your bundle configuration listing every container or balance field you want to allow:
+Nothing is tradeable by default. Add an `Exchangeable` table to your bundle configuration listing every container or balance field you want to allow. Each entry is an `ExchangeableSpec`.
 
 ```lua
 return Scribe({
@@ -39,6 +39,28 @@ return Scribe({
 
 Scribe validates these declarations at startup. An unsafe declaration — a typo in a path, a `Qty` field with no `Min`, a `Scribe.Big` quantity — is a boot error.
 
+### ExchangeableSpec fields
+
+<ParamField body="Path" type="{ string }" required>
+  Array of path segments pointing to the container or balance field (e.g. `{ "Inventory" }` or `{ "Coins" }`).
+</ParamField>
+
+<ParamField body="Kind" type='"Key" | "Qty" | "Stack"' required>
+  The transfer kind for this declaration.
+</ParamField>
+
+<ParamField body="Count" type="string">
+  For `Stack` declarations: the field name that holds the stack quantity (e.g. `"Qty"`). Must be a bounded `Scribe.Int`.
+</ParamField>
+
+<ParamField body="Identity" type="{ string }">
+  For `Stack` declarations: fields that describe the item and must match when two stacks merge. Both halves of a split keep the value.
+</ParamField>
+
+<ParamField body="Ignore" type="{ string }">
+  For `Stack` and `Key` declarations: fields that belong to the owner and should not travel with the item. Reset to declared defaults at the destination. **Ignored fields are not returned on abort** — never put fields that represent value in `Ignore`.
+</ParamField>
+
 ## Leg kinds
 
 Each basket entry is called a **leg**. Choose the `Kind` by what you want to move:
@@ -53,7 +75,7 @@ Name the container itself, not a path that reaches through it to a child field.
 
 ## Attempting a trade
 
-Build both baskets on the server after verifying both players' consent and your game's trade rules. Each basket lists what **that player gives**:
+Build both baskets on the server after verifying both players' consent and your game's trade rules. Each basket is a `{ ExchangeLeg }` array listing what **that player gives**:
 
 ```lua
 local Data = require(ReplicatedStorage.Shared.EmberfallData).Server
@@ -88,6 +110,26 @@ end
 A decision (`"Committed"` or `"Aborted"`) and a completed delivery are separate. A full inventory or a conflicting key can leave a delivery waiting even after the verdict is recorded. Always show open exchanges to the player.
 </Warning>
 
+## ExchangeLeg fields
+
+Each leg in a basket has the following shape:
+
+<ParamField body="Path" type="{ string }" required>
+  Array of path segments pointing to the container or balance field (e.g. `{ "Inventory" }` or `{ "Coins" }`).
+</ParamField>
+
+<ParamField body="Kind" type='"Key" | "Qty" | "Stack"' required>
+  The transfer kind. Must match a declared `Exchangeable` entry for the same path.
+</ParamField>
+
+<ParamField body="Key" type="any">
+  For `Key` and `Stack` legs: the container key to move (e.g. `"Emberblade"`).
+</ParamField>
+
+<ParamField body="Amount" type="number">
+  For `Qty` and `Stack` legs: how much to move. For `Stack`, both the moved count and the remainder must satisfy the count field's `Min`.
+</ParamField>
+
 ## Viewing open exchanges
 
 `Data.Exchange.Open(player)` returns every pending exchange and the value it holds. Use this server-side result to build your pending-trade UI:
@@ -95,7 +137,9 @@ A decision (`"Committed"` or `"Aborted"`) and a completed delivery are separate.
 ```lua
 for _, open in Data.Exchange.Open(alice) do
     print(open.Id, open.State)
-    -- open.State: "Claimed" | "Staked" | "Delivering"
+    -- open.State:   "Claimed" | "Staked" | "Delivering"
+    -- open.Partner: number?   (the other player's UserId)
+    -- open.Since:   number?   (when escrow began)
 
     for _, leg in open.Staked do
         print("gave:", leg.Kind, leg.Key or leg.Amount)
@@ -106,6 +150,34 @@ for _, open in Data.Exchange.Open(alice) do
 end
 ```
 
+### OpenExchange fields
+
+Each entry returned by `Exchange.Open` has the following shape:
+
+<ResponseField name="Id" type="string">
+  Unique exchange identifier.
+</ResponseField>
+
+<ResponseField name="State" type='"Claimed" | "Staked" | "Delivering"'>
+  Current phase of this exchange record.
+</ResponseField>
+
+<ResponseField name="Partner" type="number?">
+  The other player's `UserId`, if known.
+</ResponseField>
+
+<ResponseField name="Staked" type="{ OpenLeg }">
+  What this player handed over and is currently held in escrow.
+</ResponseField>
+
+<ResponseField name="Owed" type="{ OpenLeg }">
+  What this player is owed.
+</ResponseField>
+
+<ResponseField name="Since" type="number?">
+  Timestamp when the value was staked into escrow.
+</ResponseField>
+
 <Info>
 Items held in escrow have left the player's inventory. Without a pending-trade UI, players see a hole where their items were. The `Exchange.Open` call is how you show them what's happening and what they're owed.
 </Info>
@@ -113,24 +185,6 @@ Items held in escrow have left the player's inventory. Without a pending-trade U
 ## Escrow: how value is held
 
 When `Attempt` runs, offered items leave each player's inventory and are held in escrow under a shared exchange record. The players can continue playing — other fields remain writable — but the escrowed value cannot be spent. Resolution retries automatically on each profile load and on periodic sweeps. There is no maximum time by which a trade must finish.
-
-### ExchangeLeg fields
-
-<ParamField body="Path" type="{ string }" required>
-  Array of path segments pointing to the container or balance field (e.g. `{ "Inventory" }` or `{ "Coins" }`).
-</ParamField>
-
-<ParamField body="Kind" type='"Key" | "Qty" | "Stack"' required>
-  The transfer kind. Must match a declared `Exchangeable` entry for the same path.
-</ParamField>
-
-<ParamField body="Key" type="string">
-  For `Key` and `Stack` legs: the container key to move (e.g. `"Emberblade"`).
-</ParamField>
-
-<ParamField body="Amount" type="number">
-  For `Qty` and `Stack` legs: how much to move. For `Stack`, both the moved count and the remainder must satisfy the count field's `Min`.
-</ParamField>
 
 ## Trading part of a stack
 
@@ -151,23 +205,7 @@ Both the moved count and any remainder must meet the count field's `Min`. With `
 | 5 | 0 | Allowed: whole stack moves (entry removed) |
 | 3 | 2 | Allowed when both ≥ Min |
 
-### Classifying stack fields
-
-Every field in a record stack element must be classified in the `Exchangeable` declaration:
-
-<ParamField body="Count" type="string" required>
-  The field that holds the stack quantity (e.g. `"Qty"`). Must be a bounded `Scribe.Int`.
-</ParamField>
-
-<ParamField body="Identity" type="{ string }">
-  Fields that describe the item and must match when two stacks merge (e.g. `"Rarity"`). Both halves of a split keep the identity value.
-</ParamField>
-
-<ParamField body="Ignore" type="{ string }">
-  Fields that belong to the owner and should not travel with the item (e.g. `"Locked"`). Ignored fields are reset to their declared defaults at the destination. **Ignored fields are not returned on abort** — never put fields that represent value in `Ignore`.
-</ParamField>
-
-Scribe refuses to start if any field in the element shape is unclassified — adding a new field to a container element later without updating the declaration is a boot error.
+Scribe refuses to start if any field in a record stack element is unclassified — adding a new field to a container element later without updating the declaration is a boot error.
 
 ## Allowlist limitations
 
@@ -198,7 +236,7 @@ These are for investigating stalled exchanges — trades that cannot resolve aut
 
 ### Exchange.Discard
 
-Drops an abandoned **claim** that never took value. Refuses if the claim has a verdict or any staked value:
+`Data.Exchange.Discard(exchangeId)` drops an abandoned **claim** that never took value. Refuses if the claim has a verdict or any staked value:
 
 ```lua
 local ok, reason = Data.Exchange.Discard(exchangeId)
@@ -208,7 +246,7 @@ Use this for a claim left behind by a server that died between claiming a trade 
 
 ### Exchange.Settle
 
-Forces `"Commit"` or `"Abort"` on an exchange that cannot resolve itself:
+`Data.Exchange.Settle(exchangeId, verdict)` forces `"Commit"` or `"Abort"` on an exchange that cannot resolve itself:
 
 ```lua
 local ok, reason = Data.Exchange.Settle(exchangeId, "Abort")
@@ -221,7 +259,7 @@ local ok, reason = Data.Exchange.Settle(exchangeId, "Abort")
 
 ### Exchange.Redirect
 
-Moves a **parked** delivery to a different key in the same container when the original destination key is blocked:
+`Data.Exchange.Redirect(exchangeId, userId, newKey)` moves a **parked** delivery to a different key in the same container when the original destination key is blocked:
 
 ```lua
 local ok, reason = Data.Exchange.Redirect(exchangeId, userId, "EmberbladeB")

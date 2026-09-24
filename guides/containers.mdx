@@ -55,16 +55,16 @@ data.Inventory.Remove("Emberblade")
   A key exists only once something writes it. `Get()` on an unwritten key returns `nil` and `Count()` excludes it.
 </Note>
 
-### Additional dict/map methods
+### DictOf / MapOf methods
 
-| Method | What it does |
-|---|---|
-| `Remove(key)` | Removes the entry at `key` |
-| `Count()` | Returns the number of entries |
-| `Clear()` | Removes all entries |
-| `OnKeyAdded(fn)` | Fires `(key, entry)` when a new key is written |
-| `OnKeyRemoved(fn)` | Fires `(key, entry)` when a key is removed |
-| `OnChildChanged(fn)` | Fires `(key, new, old)` when any direct child's value changes |
+| Method | Signature | What it does |
+|---|---|---|
+| `Remove(key, silent?)` | `(string, boolean?) -> value?` | Removes the entry at `key`; returns the removed value |
+| `Count()` | `() -> number` | Returns the number of entries |
+| `Clear(silent?)` | `(boolean?) -> ()` | Removes all entries |
+| `OnKeyAdded(fn)` | `(fn) -> disconnect` | Fires `(key, entry)` when a new key is written |
+| `OnKeyRemoved(fn)` | `(fn) -> disconnect` | Fires `(key, entry)` when a key is removed |
+| `OnChildChanged(fn)` | `(fn) -> disconnect` | Fires `(key, new, old)` when any direct child's value changes |
 
 ## ArrayOf — Ordered Lists
 
@@ -109,17 +109,17 @@ RecentRuns = Scribe.ArrayOf({ ... }, { MaxItems = 10, Evict = "Front" }),
 
 ### Array-specific methods
 
-| Method | What it does |
-|---|---|
-| `Insert(entry, index?)` | Inserts at `index` (default: end) |
-| `Remove(index)` | Removes and returns the entry at `index` |
-| `RemoveValue(entry)` | Removes the first entry matching `entry` by value |
-| `Find(entry)` | Returns the index of the first matching entry, or `nil` |
-| `Has(entry)` | Returns whether any entry matches `entry` by value |
-| `Count()` | Returns the number of entries |
-| `Clear()` | Removes all entries |
-| `OnInsert(fn)` | Fires `(entry, index)` when an entry is inserted |
-| `OnRemove(fn)` | Fires `(entry, index)` when an entry is removed |
+| Method | Signature | What it does |
+|---|---|---|
+| `Insert(element, index?, silent?)` | `(element, number?, boolean?) -> ()` | Inserts at `index` (default: end) |
+| `Remove(index?, silent?)` | `(number?, boolean?) -> element?` | Removes and returns the entry at `index` (default: last) |
+| `RemoveValue(element, silent?)` | `(element, boolean?) -> (element?, number?)` | Removes the first entry matching `element` by value; returns the removed value and its former index |
+| `Find(element)` | `(element) -> number?` | Returns the index of the first matching entry, or `nil` |
+| `Has(element)` | `(element) -> boolean` | Returns whether any entry matches `element` by value |
+| `Count()` | `() -> number` | Returns the number of entries |
+| `Clear(silent?)` | `(boolean?) -> ()` | Removes all entries |
+| `OnInsert(fn)` | `(fn) -> disconnect` | Fires `(element, index)` when an entry is inserted |
+| `OnRemove(fn)` | `(fn) -> disconnect` | Fires `(element, index)` when an entry is removed |
 
 ## MapOf — Typed-Key Containers
 
@@ -171,6 +171,16 @@ if data.Unlocked.Add(regionId) then
 end
 ```
 
+### SetOf methods
+
+| Method | Signature | What it does |
+|---|---|---|
+| `Add(element, silent?)` | `(element, boolean?) -> boolean` | Adds `element`; returns `true` if it was newly added |
+| `Remove(element, silent?)` | `(element, boolean?) -> boolean` | Removes `element`; returns `true` if it was present |
+| `Has(element)` | `(element) -> boolean` | Returns whether `element` is a member |
+| `Count()` | `() -> number` | Returns the number of members |
+| `Clear(silent?)` | `(boolean?) -> ()` | Removes all members |
+
 <Note>
   Sets have no positional `Insert` and no index-based `Remove`, because a set has no positions. `Evict` does not apply either.
 </Note>
@@ -196,19 +206,40 @@ data.Settings.Clear()              -- every flag off
 
 `Enable`, `Disable`, `Toggle`, and `Has` each take a **member name**. `Clear` takes none. Enabling a name that is not a declared member is an error rather than a silent no-op, and setting a flag to the state it already holds writes nothing at all — no replication, no `Changed`.
 
+### Flags methods
+
+| Method | Signature | What it does |
+|---|---|---|
+| `Enable(member, silent?)` | `(string, boolean?) -> ()` | Sets the named flag on |
+| `Disable(member, silent?)` | `(string, boolean?) -> ()` | Sets the named flag off |
+| `Toggle(member, silent?)` | `(string, boolean?) -> boolean` | Flips the named flag; returns the new state |
+| `Has(member)` | `(string) -> boolean` | Returns whether the named flag is on |
+| `Clear(silent?)` | `(boolean?) -> ()` | Turns every flag off |
+
 <Accordion title="Why Flags over three sibling booleans?">
   Three separate boolean fields produce three writes, three `Changed` fires, and three chances to use a field name your template never declared. A `Flags` field is one write, one `Changed`, a compile-time list of legal member names, and it packs to a bitmask on the wire. The cap is 32 members, enforced at template compile time.
 
   The value is stored as the **enabled member names** in declaration order, so reordering or removing members in a later release is safe. Only the wire packing is positional, and both ends of a replication frame always come from the same build.
 </Accordion>
 
-## OnChildChanged
+## Container Events
 
-`OnChildChanged` fires once per write on a direct child, regardless of batching, and receives the key, the new value, and the old value.
+Four events cover a container, and they answer different questions.
+
+| Event | Arguments | Answers |
+|---|---|---|
+| `Changed` | `(new, old)` | Something beneath this changed; here is the current state |
+| `OnChildChanged` | `(key, new, old)` | This direct child moved; here are both sides |
+| `OnKeyAdded` / `OnKeyRemoved` | `(key, element)` | A key appeared or disappeared |
+| `OnInsert` / `OnRemove` | `(element, index)` | An array entry was added or dropped |
 
 ```lua
+data.Inventory.Changed(function(inventory)
+    redrawTotals(inventory)          -- once per batch, however many slots moved
+end)
+
 data.Inventory.OnChildChanged(function(itemId, new, old)
-    refreshSlot(itemId, new)
+    refreshSlot(itemId, new)         -- once per write
 end)
 
 data.Inventory.OnKeyAdded(function(itemId, entry)
@@ -239,7 +270,7 @@ end)
     | Option | Type | Meaning |
     |---|---|---|
     | `MaxKeys` | number | Maximum number of entries |
-    | `MaxKeyLength` | number | Maximum byte length of a string key (DictOf only) |
+    | `MaxKeyLength` | number | Maximum byte length of a string key (DictOf only; refused on integer MapOf) |
   </Tab>
   <Tab title="SetOf options">
     | Option | Type | Meaning |

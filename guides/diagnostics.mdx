@@ -1,7 +1,7 @@
 ---
-title: "Diagnosing and Monitoring Scribe in Production"
+title: "Scribe Diagnostics: Logs, Metrics, and Health Monitoring"
 sidebarTitle: "Diagnostics"
-description: "Monitor DataStore health, inspect log entries by stable code, track metrics and budgets, and pipe alerts to your backend — all without sending anything by default."
+description: "Read DataStore health, inspect log entries by stable code, track metrics and budgets, and wire alerts to your backend — Scribe sends nothing on its own."
 ---
 
 Scribe records every significant event with a stable code, tracks whether the DataStore backend is healthy, and keeps a running set of counters you can put on an admin panel. Nothing is sent anywhere automatically — you decide what leaves the server and where it goes. This page covers how to read those signals, what they mean, and how to wire them to your alerting setup.
@@ -168,15 +168,20 @@ Two options control what gets recorded:
 
 ```lua
 local budget = Scribe.GetBudgetSnapshot()
-print(`GetAsync budget: {budget.Available.GetAsync} / {budget.Budgets.GetAsync}`)
+if budget.Available and budget.Budgets.UpdateAsync < 10 then
+    warn(`Running low on UpdateAsync budget: {budget.Budgets.UpdateAsync} remaining`)
+end
 print(`Snapshot taken at: {budget.At}`)
 ```
 
-<ResponseField name="Available" type="{ [string]: number }">
-  Remaining budget per request type right now.
+<ResponseField name="Available" type="boolean">
+  `true` if the engine answered the budget query. `false` when the query could not be made — for example on a headless runner or in Studio with API access disabled. A `false` value means *no opinion*, not zero budget. Code that treats it as zero will stall in exactly the environments where there is nothing to conserve.
+</ResponseField>
+<ResponseField name="Reason" type="string?">
+  Why `Available` is `false`, when it is.
 </ResponseField>
 <ResponseField name="Budgets" type="{ [string]: number }">
-  Maximum budget per request type.
+  Remaining DataStore request allowance by `DataStoreRequestType` name (e.g. `UpdateAsync`, `GetAsync`). Empty when `Available` is `false`.
 </ResponseField>
 <ResponseField name="At" type="number">
   Unix timestamp when the snapshot was taken.

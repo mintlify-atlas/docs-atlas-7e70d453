@@ -1,16 +1,16 @@
 ---
-title: "Scribe API Reference Overview"
+title: "Scribe API Reference: Module Guide and Conventions"
 sidebarTitle: "Overview"
-description: "A reading guide to the Scribe API reference: which module to use, what the badges mean, and how to read type signatures."
+description: "How the Scribe API is organized across five modules, what each badge means, and how to read Luau type signatures before following a method link."
 ---
 
-The Scribe API is split across five modules. Each one owns a distinct responsibility — template declaration, server-side data management, client-side data access, per-field value methods, and types. This page explains how the reference is organized and what to look for before you follow a link to a specific method.
+The Scribe API is split across five modules. Each one owns a distinct responsibility — template declaration and global helpers, server-side data management, client-side data access, per-field value methods, and exported types. This page explains how the reference is organized and what to look for before you follow a link to a specific method.
 
 ## Which module do I need?
 
 <CardGroup cols={2}>
   <Card title="Scribe" icon="cube" href="/api/scribe">
-    Construct a data bundle, declare field types, configure the library, and access diagnostics. Everything you write in your shared data module lives here.
+    Construct a data bundle, declare field types with declarators, configure library-wide settings, and access diagnostics. Everything in your shared data module lives here.
   </Card>
   <Card title="Server" icon="server" href="/api/server">
     Load and save player profiles, register commands, run purchases and leaderboard queries, manage exchanges, and listen to server-side signals.
@@ -19,10 +19,10 @@ The Scribe API is split across five modules. Each one owns a distinct responsibi
     Wait for the first data snapshot, send requests, read leaderboard and service-status mirrors, prompt purchases, and mock data in storybooks.
   </Card>
   <Card title="Value" icon="brackets-curly" href="/api/value">
-    Methods available on every field in the accessor tree — `Get`, `Set`, `Observe`, `Changed`, arithmetic, container mutations, and timed helpers.
+    Methods available on every field in the accessor tree — `Get`, `Set`, `Observe`, `Changed`, arithmetic, container mutations, flags, and timed helpers.
   </Card>
   <Card title="Types" icon="file-code" href="/api/types">
-    All exported option tables, result shapes, enums, and named string unions used across the other four modules.
+    All exported option tables, result shapes, string unions, and named constants used across the other four modules.
   </Card>
 </CardGroup>
 
@@ -52,14 +52,14 @@ Scribe follows standard Luau annotation conventions throughout.
 - Generic type parameters appear as `<T>` and are usually inferred from context.
 
 <Tip>
-  Read the **return description** alongside the return type. A `boolean` return can mean different things for different methods — for example, `false` from `Server.Flush` does not mean the data was lost, only that confirmation did not arrive in time.
+  Read the **return description** alongside the return type. A `boolean` return can mean different things for different methods — for example, `false` from `Server.Flush` does not mean data was lost, only that confirmation did not arrive in time.
 </Tip>
 
 ## Naming conventions across the reference
 
 The reference uses these conventions consistently:
 
-- `PlayerData<T>` refers to the typed accessor tree returned by `Server.Get(player)`, `Server.WaitForData(player)`, and `Client.Get()`. Its field methods are documented on the [Value](/api/value) page.
+- `PlayerData<T>` refers to the typed accessor tree returned by `Server.Get(player)`, `Server.WaitForData(player)`, and accessible directly as `Data.<fieldName>` on the client. Its field methods are documented on the [Value](/api/value) page.
 - A `Disconnect` return is a zero-argument function. Call it to unsubscribe the listener.
 - A `Signal` exposes `Connect`, `Once`, and `Wait`. Connections return a `Connection` object with a `Disconnect` method.
 - Optional parameters with a `?` suffix have documented defaults where a default exists; omitting one is always safe.
@@ -75,7 +75,7 @@ The reference uses these conventions consistently:
 | Atomically debit and grant currency | [Server — Transaction](/api/server) |
 | Register a command clients can call | [Server — Command](/api/server) |
 | Save data before a critical operation | [Server — Flush](/api/server) |
-| Read a player's data in a LocalScript | [Client — Get / WaitForData](/api/client) |
+| Read a player's data in a LocalScript | [Client — WaitForData](/api/client) |
 | Call a server command from the client | [Client — Request](/api/client) |
 | Read a field and react to changes | [Value — Get / Observe / Changed](/api/value) |
 | Understand a type signature | [Types](/api/types) |

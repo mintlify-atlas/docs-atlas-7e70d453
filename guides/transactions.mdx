@@ -10,6 +10,8 @@ When a shop needs to take payment and grant an item at the same time, a single w
 
 `Data.Transaction(player, fn)` runs `fn` atomically on one player's data. If `fn` throws, every write inside is rolled back and `(false, error)` is returned. On success it returns `(true, nil)`.
 
+The callback **must not yield**. A yield is refused with `(false, error)` and all writes are rolled back. Do async work before or after the transaction, never inside it.
+
 ```lua
 local Data = require(ReplicatedStorage.Shared.EmberfallData).Server
 
@@ -59,6 +61,10 @@ The callback **must not yield**. No `task.wait`, no DataStore calls, no network 
 
 `Transaction` returning `true` means the writes landed on the player's in-memory tree together. They still queue for the next DataStore save. Pair `Transaction` with `Flush` when you need durable confirmation before acknowledging the operation.
 
+<Warning>
+`Transaction` covers **one player only**. Writing to a different player's tree inside the callback fails the outer transaction and rolls back all writes. There is no cross-player or cross-key transaction.
+</Warning>
+
 ## Flush — waiting for save confirmation
 
 `Data.Flush(player, opts?)` waits for the player's pending changes to be saved and returns `true` when confirmed.
@@ -93,21 +99,21 @@ If the profile is clean — nothing written since the last save, no save in flig
 
 ## GetSaveInfo — inspecting save state
 
-`Data.GetSaveInfo(player)` returns the player's current save metadata:
+`Data.GetSaveInfo(player)` returns the player's current save metadata as a `SaveInfo` table:
 
 ```lua
 local info = Data.GetSaveInfo(player)
--- info.Dirty:       boolean  -- true if there are unsaved writes
--- info.LastSaveAt:  number?  -- os.time() of the last successful save
+-- info.Dirty:       boolean        -- true if there are unsaved writes
+-- info.LastSaveAt:  number?        -- os.time() of the last successful save
 -- info.LastResult:  "Ok" | "Fail" | nil
--- info.Size:        number?  -- approx bytes of the last save (nil before first save)
+-- info.Size:        number?        -- approx bytes of the last save (nil before first save)
 ```
 
 Use this for "Saving… / Saved ✓ / Unsaved changes" UI indicators. `Size` is useful for spotting a profile approaching the ~4 MB DataStore ceiling.
 
 ## Batch — coalesced replication without rollback
 
-`Data.Batch(player, fn)` groups multiple writes into a single replication flush and fires each container's `Changed` signal once, rather than once per write. It does **not** roll back on failure — earlier writes stay applied if a later one throws.
+`Data.Batch(player, fn)` groups multiple writes into a single replication flush and fires each container's `Changed` signal once, rather than once per write. It does **not** roll back on failure — earlier writes stay applied if a later one throws. Unlike `Transaction`, the callback inside `Batch` may yield.
 
 ```lua
 -- Respawn: two stats move, the client redraws once
@@ -125,7 +131,7 @@ end)
 | Coalesces replication | yes | yes |
 | Rolls back on error | **no** | **yes** |
 | Return value | none | `(boolean, string?)` |
-| May yield inside | yes | **no** |
+| May yield inside | **yes** | **no** |
 
 Use `Transaction` when all changes must succeed together. Use `Batch` purely to reduce the number of replication frames and `Changed` notifications. Wrapping a `Transaction` in a `Batch` is unnecessary — transactions already coalesce their writes.
 

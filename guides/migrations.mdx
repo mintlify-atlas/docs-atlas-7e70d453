@@ -8,7 +8,7 @@ Scribe gives you two distinct tools for evolving player data over time. The `Mig
 
 ## Migrations — evolving your template on Scribe
 
-Add a `Migrations` table to your bundle config: a map from integer version numbers (starting at 2) to transform functions. Each function receives a plain data table and modifies it in place:
+Add a `Migrations` table to your bundle config: a map from integer version numbers (starting at 2) to transform functions. Each function receives a plain `{ [string]: any }` data table and modifies it in place:
 
 ```lua
 return Scribe({
@@ -76,7 +76,7 @@ Writing an unpacked datatype is flagged as `PROFILE_UNPERSISTABLE` at load, whic
 
 ## ImportLegacyData — one-time import from another library
 
-If your data lives in DataStore2, a hand-rolled store, or any library Scribe cannot read directly, use `ImportLegacyData`. The hook runs once per player who has never completed a Scribe save, receives the player and their userId, may yield, and returns a plain table of top-level keys:
+If your data lives in DataStore2, a hand-rolled store, or any library Scribe cannot read directly, use `ImportLegacyData`. The hook receives a `Player`, the player's `userId` as a `number`, and a `MigrationContext` for budget pacing. It may yield, and it returns a plain table of top-level keys — or `nil` to treat the player as new:
 
 ```lua
 return Scribe({
@@ -84,7 +84,7 @@ return Scribe({
     ProfileStoreIndex = "EmberfallData",
     ProfileKeyPrefix  = "PLAYER_",
 
-    ImportLegacyData = function(player, userId)
+    ImportLegacyData = function(player, userId, migration)
         local old = OldEmberfallStore:Get(userId) -- may yield; fine here
         if old == nil then
             return nil -- no legacy record; treat as new player
@@ -107,7 +107,13 @@ Return `nil` **only** when you are certain there is nothing to carry. If your Da
 
 ### MigrationContext.AwaitBudget — pacing multi-store reads
 
-When a migration reads multiple DataStore keys (a main store plus sharded leaderboard stores, for example), the burst of concurrent reads can exceed Roblox's throttle. The third argument to `ImportLegacyData` provides a budget queue:
+`MigrationContext` is the third argument to `ImportLegacyData` and the fourth argument to `OnPlayerInit`. It exposes one method:
+
+```
+AwaitBudget(requestType: string, count?: number, timeout?: number) -> (boolean, () -> ())
+```
+
+`AwaitBudget` yields until `count` requests of that type are available (default 1, timeout 120 seconds). It returns `(granted: boolean, release: () -> ())`. Call `release` as soon as you have issued the requests — not after they return. Skipping `release` is safe but causes the next waiter to wait longer than necessary.
 
 ```lua
 ImportLegacyData = function(player, userId, migration)
@@ -124,8 +130,6 @@ ImportLegacyData = function(player, userId, migration)
 end,
 ```
 
-`AwaitBudget(requestType, count?, timeout?)` yields until `count` requests of that type are available (default 1, timeout 120 seconds). It returns `(granted: boolean, release: () -> ())`. Call `release` as soon as you have issued the requests — not after they return. Skipping `release` is safe but causes the next waiter to wait longer than necessary.
-
 Budgets are per request type. `GetSortedAsync` and `GetAsync` draw on different allowances.
 
 <Tip>
@@ -134,18 +138,36 @@ Use `Data.GetState(player)` to read the current load phase. It returns `"Importi
 
 ### OnPlayerInit — first-join initialization
 
-`OnPlayerInit` fires for every new profile (one that has never had a Scribe save), after migrations, and receives the same `migration` context as a fourth argument for any paced reads. Use it to grant a starter kit or set first-join timestamps:
+`OnPlayerInit` fires for every profile after migrations. It receives four arguments: `player`, `rawData` (the plain data table), `isNewProfile` (boolean), and a `MigrationContext` for any paced reads. Use it to grant a starter kit or set first-join timestamps:
 
 ```lua
-OnPlayerInit = function(player, data, isNewProfile, migration)
+OnPlayerInit = function(player, rawData, isNewProfile, migration)
     if not isNewProfile then return end
 
-    data.Coins = 100
-    data.Inventory["StarterSword"] = { Qty = 1, Rarity = "Common" }
+    rawData.Coins = 100
+    rawData.Inventory["StarterSword"] = { Qty = 1, Rarity = "Common" }
 end,
 ```
 
 `OnPlayerInit` is not behind `MigrationConcurrency`, so it runs for every join. Keep it cheap; use `migration.AwaitBudget` only for genuinely necessary reads.
+
+## MigrationConcurrency
+
+`MigrationConcurrency` limits how many `ImportLegacyData` hooks may run at once. Defaults to 2. Increase it cautiously — each concurrent import spends DataStore request budget, and too many at once can throttle ordinary gameplay reads.
+
+```lua
+MigrationConcurrency = 4, -- up to 4 imports run in parallel
+```
+
+## MigrationShadow — auditing imports
+
+The `MigrationShadow` option is a `boolean` that, when `true`, re-runs your migration bodies against raw pre-reconcile data and warns on any divergence. Use it during development to verify that your migration logic produces the expected output:
+
+```lua
+MigrationShadow = true, -- warns if migration output diverges from expected shape
+```
+
+Disable it once the migration is stable. This option re-executes your migration bodies as an audit check and does not write shadow data to a separate store.
 
 ## Already on ProfileStore or ProfileService
 
@@ -187,16 +209,6 @@ end
 ```
 
 `RestoreVersion` fails closed if the user has a live session anywhere. The reserved `_Scribe` root (receipts, gifts, perks, purchase log) is **not** rolled back by default — those events did not un-happen. The schema `Version` is the one exception: it travels with the game data so that the migration chain can run correctly. Pass `{ RollBackReserved = true }` only when the `_Scribe` root is itself corrupt.
-
-## MigrationShadow — auditing imports
-
-The `MigrationShadow` option writes every imported or migrated profile to a separate DataStore key before the session begins. Use it during a cutover to audit what Scribe accepted without touching live data:
-
-```lua
-MigrationShadow = "EmberfallMigrationAudit", -- the DataStore name to shadow into
-```
-
-Disable it once the migration is stable. The shadow key is not read by Scribe and must be cleaned up separately.
 
 ## GDPR: Erase and Export
 

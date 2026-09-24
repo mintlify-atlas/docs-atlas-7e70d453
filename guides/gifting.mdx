@@ -8,7 +8,7 @@ Gifting in Scribe lets one player buy a developer product for another. Because R
 
 ## Sending a gift
 
-Call `PromptGift` from a server script with the buyer, the product name, and the recipient's `UserId`. The call yields while it writes a durable intent record, then shows the buyer a Robux purchase prompt.
+Call `PromptGift` from a server script with the buyer `Player`, the product name, and the recipient's `UserId` as a `number`. The call yields while it writes a durable intent record, then shows the buyer a Robux purchase prompt.
 
 ```lua
 local Data = require(ReplicatedStorage.Shared.EmberfallData).Server
@@ -77,6 +77,8 @@ end)
 
 ### Reading gift credit balances
 
+`Data.GetGiftCredits(player)` returns `{ [string]: number }` — a map of product name to unassigned credit count. Credits replicate to their owner by default, so the client version takes no argument:
+
 ```lua
 -- Server
 local credits = Data.GetGiftCredits(player)
@@ -94,49 +96,65 @@ end
 
 ## GiftReason refusal reference
 
-`PromptGift` returns `(false, reason)` for every refusal. All but `InvalidRecipient` are sentences suitable to show the buyer directly.
+`PromptGift` returns `(false, reason)` for every refusal. All but `InvalidRecipient` are sentences suitable to show the buyer directly. Two additional non-member reasons are interpolated at runtime: `unknown product "<name>"` and `purchase prompt failed: <err>`.
 
-<ResponseField name="BuyerDataNotLoaded" type="GiftReason">
+<ResponseField name="BuyerDataNotLoaded" type='"buyer data not loaded"'>
   The buyer's profile is not Ready. Show a "try again" message.
 </ResponseField>
 
-<ResponseField name="InvalidRecipient" type="GiftReason">
+<ResponseField name="InvalidRecipient" type='"invalid recipient"'>
   The recipient `UserId` is invalid. A developer error — do not display as-is.
 </ResponseField>
 
-<ResponseField name="CannotGiftYourself" type="GiftReason">
+<ResponseField name="CannotGiftYourself" type='"cannot gift yourself"'>
   The buyer and recipient are the same player.
 </ResponseField>
 
-<ResponseField name="GiftCooldown" type="GiftReason">
+<ResponseField name="GiftCooldown" type='"gift cooldown"'>
   The buyer is within the cooldown window. Safe to silently swallow for double-clicks.
 </ResponseField>
 
-<ResponseField name="TooManyPending" type="GiftReason">
+<ResponseField name="ProductRetired" type='"product retired"'>
+  The product has been moved to `RetiredProducts`. Existing paid credits remain redeemable.
+</ResponseField>
+
+<ResponseField name="TooManyPending" type='"too many pending gifts"'>
   The buyer has too many unresolved gift intents. Governed by `GiftMaxPending`.
 </ResponseField>
 
-<ResponseField name="RecipientAlreadyOwns" type="GiftReason">
+<ResponseField name="DataServicesDown" type='"data services are experiencing issues; try again later"'>
+  DataStore services are degraded. Retry later.
+</ResponseField>
+
+<ResponseField name="RecipientAlreadyOwns" type='"recipient already owns this"'>
   The recipient already holds the perk this product grants. Show a "they already have that" message.
 </ResponseField>
 
-<ResponseField name="AlreadyPending" type="GiftReason">
-  A gift of this product is already unresolved for this buyer, or a purchase/gift dialog is still open. Neither time nor a rejoin resets it — wait for the previous gift to settle.
+<ResponseField name="CreditReserveFailed" type='"could not reserve gift credit; try again later"'>
+  The durable credit slot could not be written. Retry later.
 </ResponseField>
 
-<ResponseField name="DeliveryFailed" type="GiftReason">
+<ResponseField name="DeliveryFailed" type='"could not deliver gift; try again later"'>
   The gift provably did not go out. The spent credit has been returned. **Retrying is safe.**
 </ResponseField>
 
-<ResponseField name="DeliveryUnconfirmed" type="GiftReason">
+<ResponseField name="DeliveryUnconfirmed" type='"gift delivery could not be confirmed; do not send it again"'>
   The delivery write may have committed but its answer was lost. The credit stays spent. **Do not retry** — a retry would issue a fresh credit that the recipient's deduplication cannot catch, granting twice off one payment.
 </ResponseField>
 
-<ResponseField name="PaidRandomRestricted" type="GiftReason">
+<ResponseField name="AlreadyPending" type='"a gift of this item is already pending; try again shortly"'>
+  A gift of this product is already unresolved for this buyer, or a purchase/gift dialog is still open. Neither time nor a rejoin resets it — wait for the previous gift to settle.
+</ResponseField>
+
+<ResponseField name="IntentRecordFailed" type='"could not record gift intent; try again later"'>
+  The durable intent write failed before the prompt was shown. Retry later.
+</ResponseField>
+
+<ResponseField name="PaidRandomRestricted" type='"paid random items are not available for this account"'>
   The buyer's account policy restricts paid random items and this product is flagged `PaidRandom = true`.
 </ResponseField>
 
-<ResponseField name="PolicyPending" type="GiftReason">
+<ResponseField name="PolicyPending" type='"cannot check account settings right now; try again in a moment"'>
   The buyer's or recipient's paid-random policy is not yet known. Only relevant for products with `PaidRandom = true`.
 </ResponseField>
 

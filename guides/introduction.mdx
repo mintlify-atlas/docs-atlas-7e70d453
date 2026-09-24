@@ -1,7 +1,7 @@
 ---
-title: "Scribe: Typed Player Data for Roblox Games"
+title: "Introduction to Scribe — Typed Roblox Player Data"
 sidebarTitle: "Introduction"
-description: "Scribe is a persistent, fully-typed, automatically-replicated player data library for Roblox Luau and roblox-ts, built on top of ProfileStore."
+description: "Declare your data once; Scribe manages persistence, replication, and type safety — built on ProfileStore with session locking, leaderboards, and gifting."
 ---
 
 Scribe is a player data library for Roblox that handles persistence, replication, and type safety in one place. You describe your data once — a plain Lua table called a **template** — and Scribe turns every field into a typed accessor you can call from both the server and the client with no extra wiring. When a field changes on the server it streams to the client automatically; your UI just observes the value it needs.

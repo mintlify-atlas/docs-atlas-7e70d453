@@ -1,5 +1,5 @@
 ---
-title: "Client API Reference for Scribe"
+title: "Scribe Client API: Data Access, Requests, and Mocks"
 sidebarTitle: "Client"
 description: "Complete reference for Scribe's Client API: data access, requests, leaderboards, monetization, service status, shared state, and edit-mode mocks."
 ---
@@ -24,7 +24,7 @@ Returns whether the first Init snapshot has arrived. Non-yielding. Before this r
 
 ### `Client.WaitForData(timeout?)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
 
-Yields until the first Init snapshot arrives, then returns `true`. Returns `false` if `timeout` seconds (default `30`) pass first. Use it to gate startup logic; for reactive UI, prefer `Observe`/`Changed` on individual fields.
+Yields until the first Init snapshot arrives, then returns `true`. Returns `false` if `timeout` seconds (default `30`) pass first. It never hangs. Use it to gate startup logic; for reactive UI, prefer `Observe`/`Changed` on individual fields.
 
 ```lua
 if Data.WaitForData() then
@@ -35,13 +35,9 @@ end
 <ParamField body="timeout" type="number">Maximum seconds to wait. Default `30`.</ParamField>
 <ResponseField name="boolean" type="boolean">`true` when data arrived, `false` on timeout.</ResponseField>
 
----
-
-### `Client.Get()` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
-
-Returns the typed accessor tree for the local player. Reads return template defaults until the first snapshot arrives. `Data.<fieldName>` also resolves through the accessor tree via a metatable, so `Data.Coins` is equivalent to `Data.Get().Coins`.
-
-<ResponseField name="data" type="PlayerData<T>">The typed accessor tree.</ResponseField>
+<Note>
+  `Client.WaitForData` returns a single `boolean`, unlike `Server.WaitForData` which returns `(data?, reason?)`. On the client there is always exactly one local player, so there is no failure reason — the call either succeeds or times out.
+</Note>
 
 ---
 
@@ -84,7 +80,7 @@ end
 <ParamField body="...args" type="any">Arguments forwarded to the handler after shape validation.</ParamField>
 
 <ResponseField name="...any" type="...any">
-  Whatever the handler returned. On a Scribe refusal, the result is `false`, a [`RequestReason`](/api/types#requestreason) string, and [`Scribe.RequestFailed`](/api/types#requestfailed) in a third slot. Test that third value to distinguish a framework refusal from a handler message.
+  Whatever the handler returned. When Scribe refuses rather than your handler, the result is `false`, a [`RequestReason`](/api/types#requestreason) string, and [`Scribe.RequestFailed`](/api/types#requestfailed) in a third slot. Test that third value to distinguish a framework refusal from a handler message.
 </ResponseField>
 
 ---
@@ -126,6 +122,9 @@ Returns the cached top-N of a replicated board (`Replicate = true`), streamed to
 
 The local player's rank on a replicated board, or `nil` if unranked.
 
+<ParamField body="name" type="string" required>Board name.</ParamField>
+<ResponseField name="rank" type="number?">Rank starting at 1, or `nil` if unranked.</ResponseField>
+
 ---
 
 ### `Client.OnLeaderboard` — Signal
@@ -158,6 +157,7 @@ end
 
 The state of a declared product or pass for the local player, computed from the mirror without a round trip.
 
+<ParamField body="productName" type="string" required>Product or pass name.</ParamField>
 <ResponseField name="state" type="ProductState">See [`ProductState`](/api/types#productstate).</ResponseField>
 
 ---
@@ -194,6 +194,9 @@ Returns the local player's purchase history. Only populated when the game enable
 ### `Client.Owns(key)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
 
 Whether the local player owns a perk or pass, from the replicated mirror. Yields until data has loaded.
+
+<ParamField body="key" type="string" required></ParamField>
+<ResponseField name="boolean" type="boolean"></ResponseField>
 
 ---
 
@@ -243,7 +246,7 @@ Fires with the new status string whenever service health changes.
 
 ### `Client.GetSaveInfo()` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
 
-The owner's replicated save state for "Saving… / Saved ✓" UI.
+The owner's replicated save state for "Saving… / Saved ✓" UI. Note there is no player argument on the client — it always returns the local player's save info.
 
 <ResponseField name="SaveInfo" type="SaveInfo">See [`SaveInfo`](/api/types#saveinfo).</ResponseField>
 
@@ -276,7 +279,7 @@ These APIs are only available in edit mode (when `RunService:IsRunning()` is `fa
 
 ### `Client.Mock(values?, scribeState?)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
 
-Seeds mock data for edit mode. Deep-merges `values` into the mirror so components render with realistic state.
+Seeds mock data for edit mode. Deep-merges `values` into the mirror so components render with realistic state. **Errors outside edit mode.**
 
 ```lua
 Data.Mock(
@@ -298,7 +301,7 @@ Data.Mock(
 
 ### `Client.MockCommand(name, handler)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
 
-Registers a fake handler so `Client.Request` resolves in edit mode without a server.
+Registers a fake handler so `Client.Request` resolves in edit mode without a server. **Errors outside edit mode.**
 
 ```lua
 Data.MockCommand("EquipItem", function(itemId)

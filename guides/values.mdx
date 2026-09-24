@@ -38,7 +38,7 @@ local stop = Data.Coins.Observe(function(coins)
 end)
 
 Data.Level.Changed(function(new, old)
-    -- fires only when the value actually changes
+    -- fires only when the value actually changes; receives (new, old)
     if new > old then
         playLevelUpEffect(new)
     end
@@ -48,12 +48,12 @@ end)
 Both return a **disconnect function**. Call it to stop receiving updates.
 
 <Tip>
-  Use `Observe` for UI elements that need to display a value from the first frame. Use `Changed` when you only care about the transition itself, such as triggering a sound or awarding a bonus.
+  Use `Observe` for UI elements that need to display a value from the first frame. Use `Changed` when you only care about the transition itself — such as triggering a sound or awarding a bonus — because it gives you both the new and the old value.
 </Tip>
 
 ## Update
 
-`Update` reads the current value, passes it to your function, and stores whatever you return. It saves you the manual read-then-write pattern and keeps both halves of the operation next to each other.
+`Update` reads the current value, passes it to your function, and stores whatever you return. It saves you the manual read-then-write pattern and keeps both halves of the operation next to each other. The optional second argument is a `silent` boolean — pass `true` to suppress replication for this write.
 
 ```lua
 -- round a coin balance down to the nearest ten
@@ -116,7 +116,7 @@ data.Coins.Decrement(25)      --> 125
 levelBar.Size = UDim2.fromScale(Data.Level.Get() / Data.Level.Max(), 1)
 ```
 
-The optional second argument to `Increment` and `Decrement` is an economy-analytics metadata table. Pass one and Scribe emits a Roblox economy event for that write:
+The optional second argument to `Increment` and `Decrement` is an `EconomyMeta` table. Pass one and Scribe emits a Roblox economy event for that write, with the field's name as the currency:
 
 ```lua
 data.Coins.Increment(500, {
@@ -125,9 +125,11 @@ data.Coins.Increment(500, {
 })
 ```
 
+The `EconomyMeta` table accepts `Flow`, `TransactionType`, `ItemSku`, `Currency`, and `Fields`. See [Monetization](/guides/monetization) for the full economy analytics reference. To suppress replication without attaching an economy event, use `Set` or `Update` with `silent = true`.
+
 ## Booleans: Toggle
 
-A plain boolean field has one extra method: `Toggle`, which flips the current value and returns the new state.
+A plain boolean field has one extra method: `Toggle(silent?)`, which flips the current value and returns the new state.
 
 ```lua
 data.MusicEnabled.Toggle()   --> false (was true)
@@ -136,15 +138,17 @@ data.MusicEnabled.Toggle()   --> true
 
 ## The `silent` Parameter
 
-Most mutators accept a trailing `replicate` boolean. Pass `false` and the write happens on the server, persists normally, and is simply not sent to the client. Reach for it on fields that change very often and that no client UI reads.
+Most mutators accept a trailing `silent` boolean. Pass `true` and the write happens on the server, persists normally, and is simply **not sent to the client**. Reach for it on fields that change very often and that no client UI reads.
 
 ```lua
 -- increment playtime without sending a diff on every heartbeat
-data.Stats.Playtime.Increment(60, false)
+data.Stats.Playtime.Increment(60, true)
 ```
 
 <Note>
-  If the client should **never** see a field at all, declare it with `Scribe.ServerOnly` in your template rather than passing `false` on every write. `ServerOnly` is a statement about the field; `false` is a statement about one write.
+  On `Increment` and `Decrement`, the second argument is normally an `EconomyMeta?` table, not a boolean. Passing `true` there has no effect — Scribe ignores a non-table value in that slot. To silence those writes, use `Set` or `Update` with `true` as their second argument.
+
+  If the client should **never** see a field at all, declare it with `Scribe.ServerOnly` in your template rather than passing `true` on every write. `ServerOnly` is a statement about the field; `silent` is a statement about one write.
 </Note>
 
 ## Batch
@@ -158,6 +162,7 @@ Data.Batch(player, function()
     data.Current.Set(nextZone)
 end)
 -- data.Changed fires ONCE with the end state
+-- data.OnChildChanged fires three times: Index, StartedAt, Current
 ```
 
 On the client, `Data.Batch(fn)` does the same for local writes — useful when a UI update touches several fields and you want `Changed` to fire once.
@@ -168,6 +173,7 @@ Data.Batch(function()
     Data.Equipped.Set("Sword")
     Data.Inventory.Sword.Qty.Decrement(1)
 end)
+-- Data.Inventory.Changed fires ONCE
 ```
 
 ## Container Listeners

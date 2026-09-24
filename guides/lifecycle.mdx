@@ -33,7 +33,7 @@ When a player joins the server, Scribe immediately begins loading their profile 
 
 ## Waiting for Data on the Server
 
-Never read a player's data before it is ready. Use `Data.WaitForData(player, timeout?)`, which yields until the profile is `Ready` and returns `(accessor?, reason?)`.
+Never read a player's data before it is ready. Use `Data.WaitForData(player, timeout?)`, which yields until the profile is `Ready` and returns `(accessor?, reason?)`. Always handle the `nil` branch before touching any fields.
 
 ```lua
 Players.PlayerAdded:Connect(function(player)
@@ -98,7 +98,7 @@ end
 ```lua
 local state, phase = Data.GetState(player)
 -- state: "Loading" | "Ready" | "SessionEnded"
--- phase: LoadPhase? (nil unless Loading)
+-- phase: LoadPhase? (nil unless state is "Loading")
 ```
 
 ### All LoadPhase Values
@@ -202,7 +202,7 @@ You receive the same typed accessor as everywhere else, so writes are validated 
 
 ## Stop and Shutdown
 
-`Data.Stop()` releases everything a bundle holds: the timed-field sweep, the leaderboard cycle, the per-frame replication flush, the `Players` and `MarketplaceService` listeners, and the ProfileStore signal handlers. A game never needs it — bundles are built once and live for the server's lifetime. It exists for test suites and simulations that build many bundles per process.
+`Data.Stop()` releases everything a bundle holds: the timed-field sweep, the leaderboard cycle, the per-frame replication flush, the `Players` and `MarketplaceService` listeners, and the ProfileStore signal handlers. It is synchronous — it does not yield. A game never needs it — bundles are built once and live for the server's lifetime. It exists for test suites and simulations that build many bundles per process.
 
 ```lua
 local bundle = Scribe({ Template = template, ProfileStoreIndex = "Test", ProfileKeyPrefix = "T_" })
@@ -213,7 +213,7 @@ local Data = bundle.Server
 if not Data.Flush(player) then
     error("Save not confirmed")
 end
-Data.Stop()  -- idempotent; does NOT save
+Data.Stop()  -- synchronous; idempotent; does NOT save
 ```
 
 `Data.Stop()` is idempotent and does **not** save. Flush first if the data matters. The client has the same call — `Data.Stop()` releases the transport listener and the Hello retry loop, which a storybook that remounts a bundle per story needs to avoid stacking listeners.

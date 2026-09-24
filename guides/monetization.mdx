@@ -1,5 +1,5 @@
 ---
-title: "Monetization: Products, Passes, and Purchases"
+title: "Selling Products, Passes, and Soft-Currency in Scribe"
 sidebarTitle: "Monetization"
 description: "Sell developer products and game passes, spend soft currency, check ownership, and manage perks — all with Scribe's atomic, fail-closed purchase pipeline."
 ---
@@ -8,7 +8,7 @@ Scribe integrates directly with Roblox's monetization layer so that every Robux 
 
 ## Declaring products and passes
 
-Define your products and passes in the shared module alongside your template. Each `Product` entry carries a numeric `Id`, an optional `Category`, a `Grant` callback that receives the buyer's accessor tree, an optional `Grants` perk name, and an optional `PaidRandom` flag for loot boxes.
+Define your products and passes in the shared module alongside your template. Each `Products` entry carries a numeric `Id`, an optional `Category`, an optional `Grant` callback that receives the buyer's accessor tree, an optional `Grants` perk name, and an optional `PaidRandom` flag for loot boxes.
 
 ```lua
 local template = { --[[ ... ]] }
@@ -57,6 +57,38 @@ When a server script first requires this module, Scribe binds `MarketplaceServic
 A `Grant` callback **must never yield**. No `task.wait`, no DataStore calls, no `MarketplaceService` calls inside it. Scribe runs the callback inside a transaction so that a partial grant is rolled back completely — but a transaction cannot survive a yield. Keep any async work outside the callback.
 </Warning>
 
+### ProductConfig fields
+
+<ParamField body="Id" type="number" required>
+  The numeric developer-product ID from the Creator Hub.
+</ParamField>
+
+<ParamField body="Category" type="string">
+  Purchase category written to the log.
+</ParamField>
+
+<ParamField body="Grant" type="(data) -> ()">
+  Callback that performs the grant when the receipt is processed. Must not yield. If it throws, the write is rolled back.
+</ParamField>
+
+<ParamField body="Grants" type="string">
+  A perk name to mark as owned after a successful purchase. `Owns(player, name)` returns `true` once granted.
+</ParamField>
+
+<ParamField body="PaidRandom" type="boolean">
+  Mark this product as a paid random item. Refused for players whose policy restricts paid random items.
+</ParamField>
+
+### PassConfig fields
+
+<ParamField body="Id" type="number" required>
+  The numeric game-pass ID from the Creator Hub.
+</ParamField>
+
+<ParamField body="Category" type="string">
+  Optional category label for logging.
+</ParamField>
+
 ## Prompting a purchase
 
 Call `PromptPurchase` by the name you declared, not by the numeric `Id`. From a server script, pass the player:
@@ -64,7 +96,7 @@ Call `PromptPurchase` by the name you declared, not by the numeric `Id`. From a 
 ```lua
 local Data = require(ReplicatedStorage.Shared.EmberfallData).Server
 
--- A server-side prompt — also works from client via Data.PromptPurchase("CoinPack500")
+-- Server-side prompt
 local ok, reason = Data.PromptPurchase(player, "CoinPack500")
 if not ok then
     warn(`Purchase refused: {reason}`)
@@ -195,7 +227,7 @@ Gate all ownership grants on the **server's** check. The client's `Owns` and `Ow
 
 ## Soft-currency purchases
 
-`Server.Purchase` is the shop-side counterpart to a Robux product. It debits a currency field, runs a grant, and writes a log entry — all or nothing. A `Grant` that throws rolls the debit back completely.
+`Data.Purchase` is the shop-side counterpart to a Robux product. It debits a currency field, runs a grant, and writes a log entry — all or nothing. A `Grant` that throws rolls the debit back completely.
 
 ```lua
 local ok, reason = Data.Purchase(player, {
@@ -259,28 +291,38 @@ end
 
 ### PurchaseReason refusals
 
-<ResponseField name="InsufficientFunds" type="string">
-  The player's balance is too low. Show a "not enough coins" message.
-</ResponseField>
+`Data.Purchase` returns `(false, reason)` for eight fixed refusals, exported as `Scribe.PurchaseReason`. Four are player-facing; four indicate a developer error in the call itself.
 
-<ResponseField name="DataNotLoaded" type="string">
+<ResponseField name="DataNotLoaded" type='"player data not loaded"'>
   The player's profile is not Ready. Show a "try again" message.
 </ResponseField>
 
-<ResponseField name="PaidRandomRestricted" type="string">
-  The player's account policy restricts paid random items.
+<ResponseField name="InvalidCostSpec" type='"invalid Cost spec"'>
+  The `Cost` table is malformed. A developer error — log it.
 </ResponseField>
 
-<ResponseField name="PolicyPending" type="string">
-  The policy check is still in flight. Retry in a moment.
+<ResponseField name="InvalidCostAmount" type='"invalid Cost amount"'>
+  The `Cost.Amount` is not a valid number. A developer error — log it.
 </ResponseField>
 
-<ResponseField name="InvalidCostPath" type="string">
+<ResponseField name="InvalidCostPath" type='"invalid cost path"'>
   The `Cost.Path` does not resolve to a field in the template. A developer error — log it.
 </ResponseField>
 
-<ResponseField name="CostPathNotSpendable" type="string">
+<ResponseField name="CostPathNotSpendable" type='"cost path is not a spendable number"'>
   The path resolves to a field that cannot be spent from (e.g. a `Scribe.Big`, a string). A developer error — log it.
+</ResponseField>
+
+<ResponseField name="InsufficientFunds" type='"insufficient funds"'>
+  The player's balance is too low. Show a "not enough coins" message.
+</ResponseField>
+
+<ResponseField name="PaidRandomRestricted" type='"paid random items are not available for this account"'>
+  The player's account policy restricts paid random items.
+</ResponseField>
+
+<ResponseField name="PolicyPending" type='"cannot check account settings right now; try again in a moment"'>
+  The policy check is still in flight. Retry in a moment.
 </ResponseField>
 
 <Note>
@@ -289,7 +331,7 @@ A grant that writes through an unresolved container key (e.g. `data.Inventory[it
 
 ## HandleReceipt and TryHandleReceipt
 
-Scribe binds `MarketplaceService.ProcessReceipt` automatically unless you set `OwnReceipts = false`. If you keep your own handler, route Scribe products through `TryHandleReceipt`:
+Scribe binds `MarketplaceService.ProcessReceipt` automatically unless you set `OwnReceipts = false`. Both `HandleReceipt` and `TryHandleReceipt` accept a `receiptInfo` table and return `Enum.ProductPurchaseDecision`. If you keep your own handler, route Scribe products through `TryHandleReceipt`:
 
 ```lua
 MarketplaceService.ProcessReceipt = function(receiptInfo)
@@ -316,7 +358,7 @@ for _, record in Data.GetPurchases(player, {
 end
 ```
 
-The `PurchaseFilter` type accepts `Kind`, `Category`, `ItemId`, `Since`, and `Limit`. Replicate either log to the client by setting `ReplicateRobux = true` or `ReplicateInGame = true` in `PurchaseLog`.
+The `PurchaseFilter` type accepts `Kind` (`"Robux" | "InGame"`), `Category`, `ItemId`, `Since`, and `Limit`. Replicate either log to the client by setting `ReplicateRobux = true` or `ReplicateInGame = true` in `PurchaseLog`.
 
 <Tip>
 Use `Data.RecordPurchase(player, entry)` to append your own entries for quest rewards, trade completions, or any exchange Scribe did not process automatically.

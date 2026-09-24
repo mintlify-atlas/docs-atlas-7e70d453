@@ -144,9 +144,13 @@ The reset clock is configured once at the bundle level:
 PeriodReset = { UtcOffset = -8, WeekStart = "Monday" },
 ```
 
-`UtcOffset` is a fixed offset from UTC in hours (fractional values are allowed for half-hour zones). `WeekStart` defaults to Monday. Changing the offset shifts every period index — plan the change between periods to avoid partial-period artifacts.
+`UtcOffset` is a fixed offset from UTC in hours (fractional values are allowed for half-hour zones, range -12 to 14). `WeekStart` defaults to Monday. Changing the offset shifts every period index — plan the change between periods to avoid partial-period artifacts.
 
 ### Timing helpers
+
+`Data.GetLeaderboardRefreshIn(name)` returns the seconds until a board next reads its store. It is `0` while a due refresh is waiting on the request budget, and `nil` until the loop has scheduled its first cycle a few seconds after boot.
+
+`Data.GetLeaderboardResetIn(name)` returns the seconds until a periodic board's current period ends. It is always above zero (at the instant of rollover the next period has begun), and `nil` for a board with no `Period`.
 
 ```lua
 -- Seconds until the board's next DataStore read
@@ -158,13 +162,13 @@ local resetIn = Data.GetLeaderboardResetIn("WinsDaily")
 
 ### Reading the previous period
 
-Pass `offset = -1` to `GetLeaderboard` on the server to read last period's winners:
+Pass `offset = -1` as the third argument to `GetLeaderboard` on the server to read last period's winners:
 
 ```lua
 local previousWinners = Data.GetLeaderboard("WinsDaily", 10, -1)
 ```
 
-Scribe reads the previous period at the first two refreshes after rollover and caches the result for the rest of the current period.
+Scribe reads the previous period at the first two refreshes after rollover and caches the result for the rest of the current period. Treat the first result as provisional while the second read is still due.
 
 ## Server-scoped boards
 
@@ -173,23 +177,31 @@ Scribe reads the previous period at the first two refreshes after rollover and c
 ```lua
 Leaderboards = {
     RoundLeaders = {
-        Stat           = "Wins",
-        Scope          = "Server",
-        Replicate      = true,
+        Stat            = "Wins",
+        Scope           = "Server",
+        Replicate       = true,
         RefreshInterval = 2, -- sort in memory every 2 seconds
     },
 },
 ```
 
-Server boards compose with `Period`, respect `Replicate`, support `GetMyRank`, and are exempt from the global read-budget guard. A player who leaves drops off at the next refresh.
+Server boards compose with `Period`, respect `Replicate`, support `GetMyRank`, and are exempt from the global read-budget guard. A player who leaves drops off at the next refresh. Passing `offset = -1` returns an empty list since nothing is stored.
 
 ## Board status and health
 
+`Data.GetLeaderboardStatus(name)` returns a `LeaderboardStatusInfo` table for inspecting board health without making a DataStore request:
+
 ```lua
 local status = Data.GetLeaderboardStatus("TopCoins")
--- status.Status: "Starting" | "Healthy" | "Degraded"
--- status.PendingWrites, status.RetryingWrites, status.RejectedWrites
--- status.ReadAge, status.LastReadError, status.LastWriteError
+-- status.Status:          "Starting" | "Healthy" | "Degraded"
+-- status.PendingWrites:   number
+-- status.RetryingWrites:  number
+-- status.RejectedWrites:  number
+-- status.LastReadAt:      number?
+-- status.ReadAge:         number?
+-- status.LastWriteAt:     number?
+-- status.LastReadError:   string?
+-- status.LastWriteError:  string?
 ```
 
 `"Starting"` means no successful refresh yet. `"Degraded"` means the cache is stale (older than twice the refresh interval) or recent operations failed. This is independent of `Scribe.GetStatus()`, which covers profile persistence health.

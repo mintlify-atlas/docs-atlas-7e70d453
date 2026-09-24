@@ -1,12 +1,12 @@
 ---
-title: "Value Accessor Methods in Scribe"
+title: "Scribe Value Accessor: Read, Write, and Observe Fields"
 sidebarTitle: "Value"
-description: "Reference for every method on a Scribe value node: reading, writing, observing, navigating, and container, flag, and timed operations."
+description: "Reference for every method on a Scribe value node: reading, writing, observing, navigating containers, flags, big-number arithmetic, and timed operations."
 ---
 
 Every field in your template becomes a **value node** — an object in the accessor tree with a consistent method surface. Whether you declared the field with `Scribe.Int`, `Scribe.ArrayOf`, or `Scribe.Flags`, the same core methods are always present. Specialized methods (arithmetic, container mutations, membership operations) are added on top based on the field's declared type.
 
-The accessor tree is reached through `Server.Get(player)` or `Server.WaitForData(player)` on the server, and through `Client.Get()` or directly as `Data.<fieldName>` on the client.
+The accessor tree is reached through `Server.Get(player)` or `Server.WaitForData(player)` on the server, and through `Data.<fieldName>` directly on the client (or any depth of the tree).
 
 ```lua
 -- Reading and writing
@@ -131,7 +131,7 @@ end)
 
 ### `Value.Child(key)` → `ValueNode`
 
-Accesses a child node by key. Used when a field name collides with a method name (e.g. a field literally named `"Get"`) and direct property access would shadow the method.
+Accesses a child node by key. Used when a field name collides with a method name (e.g. a field literally named `"Get"`) and direct property access would shadow the method. Also the typed lookup for homogeneous containers (arrays, dicts, maps, sets).
 
 ```lua
 data.Inventory.Child("Emberblade").Count.Get()
@@ -154,7 +154,7 @@ data.Coins.Increment(100)
 data.Coins.Increment(100, { Flow = "Source", TransactionType = "Gameplay" })
 ```
 
-<ParamField body="n" type="number" required>Amount to add. Must be positive.</ParamField>
+<ParamField body="n" type="number" required>Amount to add.</ParamField>
 <ParamField body="tag" type="EconomyMeta?">Optional analytics tag. See [`EconomyMeta`](/api/types#economymeta).</ParamField>
 
 ---
@@ -163,7 +163,7 @@ data.Coins.Increment(100, { Flow = "Source", TransactionType = "Gameplay" })
 
 Subtracts `n` from the current value. Returns the new value after clamping.
 
-<ParamField body="n" type="number" required>Amount to subtract. Must be positive.</ParamField>
+<ParamField body="n" type="number" required>Amount to subtract.</ParamField>
 <ParamField body="tag" type="EconomyMeta?">Optional analytics tag.</ParamField>
 
 ---
@@ -182,13 +182,14 @@ Flips the boolean and returns the new value.
 
 ## Big Numbers
 
-`Scribe.Big` fields expose all standard number methods (`Increment`, `Decrement`, `Min`, `Max`) plus the following.
+`Scribe.Big` fields expose all standard number methods (`Increment`, `Decrement`, `Set`, `Update`, `Min`, `Max`) plus the following. The `Set` and `Update` methods accept `number | string | BigValue` as input. The `Get()` return type is a [`BigValue`](/api/types#bigvalue) object.
 
 ### `Value.Multiply(operand, silent?)` → `BigValue`
 
 Multiplies the current value by `operand`. Returns the new `BigValue`.
 
 <ParamField body="operand" type="number | string | BigValue" required></ParamField>
+<ParamField body="silent" type="boolean">Suppress change notifications.</ParamField>
 
 ---
 
@@ -196,9 +197,8 @@ Multiplies the current value by `operand`. Returns the new `BigValue`.
 
 Divides the current value by `operand`. Returns the new `BigValue`.
 
----
-
-For `Scribe.Big` fields, `Set` and `Update` also accept `number | string | BigValue` in addition to the plain `BigValue` type. The `Get()` return type is a [`BigValue`](/api/types#bigvalue) object with arithmetic methods (`:Add()`, `:Subtract()`, `:Compare()`, `:Short()`, `:ToNumber()`, etc.).
+<ParamField body="operand" type="number | string | BigValue" required></ParamField>
+<ParamField body="silent" type="boolean">Suppress change notifications.</ParamField>
 
 ---
 
@@ -220,11 +220,17 @@ Inserts `element` at `index` (default: end). Fires `OnInsert`. Respects `MaxItem
 
 Removes and returns the element at `index` (default: last). Returns `nil` on an empty array.
 
+<ParamField body="index" type="number">Position to remove. Defaults to the last element.</ParamField>
+<ParamField body="silent" type="boolean">Suppress notifications.</ParamField>
+
 ---
 
 ### `Value.RemoveValue(element, silent?)` → `(T?, number?)`
 
 Finds and removes the first occurrence of `element` by value comparison. Returns the removed element and its former index, or `(nil, nil)` if not found.
+
+<ParamField body="element" type="T" required></ParamField>
+<ParamField body="silent" type="boolean">Suppress notifications.</ParamField>
 
 ---
 
@@ -264,17 +270,20 @@ Fires with `(element, index)` whenever an element is inserted.
 
 Fires with `(element, index)` whenever an element is removed.
 
+<ParamField body="callback" type="(element: T, index: number) -> ()" required></ParamField>
+
 ---
 
 ## Dictionaries and Maps
 
-Dictionary methods are available on fields declared with `Scribe.DictOf` or `Scribe.MapOf`. Dictionary children are themselves value nodes, so `data.Inventory["Emberblade"].Count.Increment(1)` is the standard pattern.
+Dictionary and map methods are available on fields declared with `Scribe.DictOf` or `Scribe.MapOf`. Children are themselves value nodes, so `data.Inventory["Emberblade"].Count.Increment(1)` is the standard pattern.
 
 ### `Value.Remove(key, silent?)` → `T?`
 
 Removes and returns the value at `key`. Returns `nil` if the key did not exist.
 
 <ParamField body="key" type="string | K" required>For `DictOf`: a string. For `MapOf`: the declared key type.</ParamField>
+<ParamField body="silent" type="boolean">Suppress notifications.</ParamField>
 
 ---
 
@@ -302,6 +311,8 @@ Fires with `(key, value)` when a new key is written.
 
 Fires with `(key, value)` when a key is removed.
 
+<ParamField body="callback" type="(key: K, value: V) -> ()" required></ParamField>
+
 ---
 
 ## Sets (`Scribe.SetOf`)
@@ -320,6 +331,9 @@ Adds `element` to the set. Returns `true` if it was not already a member (i.e. t
 ### `Value.Remove(element, silent?)` → `boolean`
 
 Removes `element` from the set. Returns `true` if it was a member. A `Remove` of an absent value writes nothing.
+
+<ParamField body="element" type="T" required></ParamField>
+<ParamField body="silent" type="boolean"></ParamField>
 
 ---
 
@@ -350,6 +364,7 @@ Flag methods are available on fields declared with `Scribe.Flags`. Members are a
 Enables the named member. Enabling an already-enabled member writes nothing.
 
 <ParamField body="member" type="string" required>Must be a declared member name.</ParamField>
+<ParamField body="silent" type="boolean"></ParamField>
 
 ---
 
@@ -357,11 +372,16 @@ Enables the named member. Enabling an already-enabled member writes nothing.
 
 Disables the named member.
 
+<ParamField body="member" type="string" required></ParamField>
+<ParamField body="silent" type="boolean"></ParamField>
+
 ---
 
 ### `Value.Has(member)` → `boolean`
 
 Returns whether the named member is currently enabled.
+
+<ParamField body="member" type="string" required></ParamField>
 
 ---
 
@@ -369,11 +389,8 @@ Returns whether the named member is currently enabled.
 
 Flips the named member and returns the new state.
 
----
-
-### `Value.Count()` → `number`
-
-Returns the number of currently enabled members.
+<ParamField body="member" type="string" required></ParamField>
+<ParamField body="silent" type="boolean"></ParamField>
 
 ---
 
@@ -381,11 +398,15 @@ Returns the number of currently enabled members.
 
 Disables all members.
 
+<Note>
+  `Scribe.Flags` does not expose a `Count` method. Use `Scribe.SetOf` if you need a counted membership collection.
+</Note>
+
 ---
 
 ## Timed Fields (`Scribe.Timed`)
 
-Timed methods are available on fields declared with `Scribe.Timed`. These are **server-only** — calling `SetTimed` or `ExtendTimed` from a `LocalScript` raises an error.
+Timed methods are available on fields declared with `Scribe.Timed`. `SetTimed` and `ExtendTimed` are **server-only** — calling them from a `LocalScript` raises an error. `Active` can be called from both the server and the client.
 
 ### `Value.SetTimed(value, duration, silent?)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
 
@@ -406,12 +427,13 @@ data.ActiveBoost.SetTimed("DoubleXP", 3600)   -- expires in 1 hour
 Adds `duration` seconds to the current expiry. Has no effect if the timer is not active.
 
 <ParamField body="duration" type="number" required>Seconds to add.</ParamField>
+<ParamField body="silent" type="boolean">Suppress notifications.</ParamField>
 
 ---
 
 ### `Value.Active()` → `(boolean, number?)`
 
-Returns whether the timer is currently active and the remaining seconds until expiry. Both the server and the client can call this.
+Returns whether the timer is currently active and the **remaining seconds** until expiry. Both the server and the client can call this. On the client, the remaining time is estimated using synchronized server time.
 
 ```lua
 local active, remaining = data.ActiveBoost.Active()

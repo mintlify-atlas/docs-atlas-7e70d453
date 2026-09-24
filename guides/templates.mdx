@@ -1,5 +1,5 @@
 ---
-title: "Declaring Your Data Template with Scribe"
+title: "Declaring a Scribe Template: Fields and Declarators"
 sidebarTitle: "Templates"
 description: "Learn how to declare player data templates using Scribe's full declarator set: scalars, containers, flags, timers, computed fields, and server-only data."
 ---
@@ -152,8 +152,8 @@ ActiveBuff = Scribe.Timed(""),
 
 ```lua
 data.LastDaily.SetTimed(true, 86400)       -- claim daily, expires in 24 h
-data.LastDaily.IsActive()                  -- true if unexpired
-data.LastDaily.TimeRemaining()             -- seconds left
+local active, remaining = data.LastDaily.Active()  -- true + seconds left if unexpired
+data.LastDaily.ExtendTimed(3600)           -- add 1 h to the remaining duration
 ```
 
 ### `Scribe.ServerOnly`
@@ -211,7 +211,7 @@ CreatedAt   = Scribe.DateTime(DateTime.now()),
 
 The full set: `Vector3`, `Vector2`, `Vector3int16`, `Vector2int16`, `CFrame`, `Color3`, `BrickColor`, `UDim`, `UDim2`, `Rect`, `NumberRange`, `NumberSequence`, `ColorSequence`, `DateTime`, `EnumItem`, `Font`, `PhysicalProperties`.
 
-See the [Datatypes guide](/guides/roblox-ts) for packing details and the `Scribe.CFrame` precision option.
+See the [Scribe API reference](/api/scribe) for packing details and the `Scribe.CFrame` precision option.
 
 </Accordion>
 

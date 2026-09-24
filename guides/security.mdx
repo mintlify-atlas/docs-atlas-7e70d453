@@ -1,7 +1,7 @@
 ---
-title: "Security Hardening and Data Integrity in Scribe"
+title: "Scribe Security: Trust Model, Guards, and Rate Limits"
 sidebarTitle: "Security"
-description: "Understand Scribe's built-in trust model, configure WipeGuard, BoundsPolicy, and rate limits, and protect your game from client abuse and data loss."
+description: "Understand Scribe's client-cannot-write trust model, configure WipeGuard and BoundsPolicy, set rate limits, and protect player data from loss and abuse."
 ---
 
 Scribe draws a hard line between what a player's client may say and what your server decides. This guide covers where that line sits, what Scribe checks before your code ever runs, and which decisions remain yours. Read it before you ship anything a player can spend money on.
@@ -83,7 +83,7 @@ Scribe({
     ProfileKeyPrefix  = "PLAYER_",
 
     WipeGuardPolicy      = "Block",   -- "Warn" (default) or "Block"
-    WipeGuardShrinkRatio = 0.5,       -- trip if the payload shrinks by more than 50%
+    WipeGuardShrinkRatio = 0.6,       -- trip if the payload shrinks by more than 40%
 })
 ```
 
@@ -201,7 +201,9 @@ Possible reasons include `OutOfBounds`, `OverMaxLength`, `InvalidUtf8`, `NotAMem
 
 ## The Exchange Allowlist
 
-The exchange system validates all legs of every trade against the `Exchangeable` allowlist you declare in your Scribe options. Nothing moves unless both the giving and receiving paths are explicitly listed there, and the amounts satisfy the declared constraints.
+The exchange system validates all legs of every trade against the `Exchangeable` allowlist you declare in your Scribe options. Nothing is exchangeable by default — a path not in `Exchangeable` cannot participate in any trade, regardless of what the server requests.
+
+Each entry declares a path and the transfer kind. `"Key"` moves a whole dictionary entry, `"Qty"` moves an amount off a numeric balance, and `"Stack"` moves entries by identity across a homogeneous array.
 
 ```lua
 Scribe({
@@ -210,13 +212,13 @@ Scribe({
     ProfileKeyPrefix  = "PLAYER_",
 
     Exchangeable = {
-        Coins = { Min = 1 },
-        Gems  = { Min = 1 },
+        Item  = { Path = { "Inventory" }, Kind = "Key" },
+        Money = { Path = { "Coins" },     Kind = "Qty" },
     },
 })
 ```
 
-A path not in `Exchangeable` cannot participate in any exchange, regardless of what the client requests.
+The full `ExchangeableSpec` shape is `{ Path: { string }, Kind: "Key" | "Qty" | "Stack", Count?: string, Identity?: { string }, Ignore?: { string } }`. See the [Exchange guide](/guides/exchange) for the complete rules, including how to set up a two-player trade using `Data.Exchange.Attempt`.
 
 ## The Audit Trail
 
@@ -250,7 +252,7 @@ All security-related options are set in the `Scribe({...})` call:
 | `WipeGuardPolicy` | `"Warn"` | A suspected wipe should not reach the DataStore at all |
 | `SchemaPolicy` | absent | You want load-time validation of stored data |
 | `VersionAheadPolicy` | `"Kick"` | You are doing a rolling deploy with compatible schemas |
-| `WipeGuardShrinkRatio` | 0.5 | Tune the shrink threshold for your data shape |
+| `WipeGuardShrinkRatio` | 0.6 | Tune the shrink threshold for your data shape |
 
 ## What to Alert On
 

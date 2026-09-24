@@ -1,7 +1,7 @@
 ---
-title: "Scribe Module API: Constructor and Declarators"
+title: "Scribe Module API: Constructor, Declarators, and Helpers"
 sidebarTitle: "Scribe"
-description: "Complete reference for the Scribe module: the bundle constructor, every field and container declarator, visibility wrappers, and global helpers."
+description: "Complete reference for the Scribe module: the bundle constructor, every field declarator, container and wrapper types, visibility helpers, and global diagnostics."
 ---
 
 The `Scribe` module is the entry point for every Scribe-powered data system. Require it in a shared `ModuleScript`, call it with your options table to receive a `{ Server, Client }` bundle, and use the declarators to describe your data shape. Everything on this page is available on both the server and the client through the same shared module.
@@ -156,7 +156,7 @@ Essence = Scribe.Big(0, { Min = 0, Max = "1e600" }),
 </ParamField>
 
 <Note>
-  `Get()` returns a [`BigValue`](/api/types#bigvalue), not a plain number. Comparing it with `<` against a plain number throws. Use `Value.Increment`, `Value.Decrement`, `Value.Multiply`, and `Value.Divide` for arithmetic, or call `:ToNumber()` to convert for display.
+  `Get()` returns a [`BigValue`](/api/types#bigvalue), not a plain number. Use `Value.Increment`, `Value.Decrement`, `Value.Multiply`, and `Value.Divide` for arithmetic, or call `:ToNumber()` to convert for display.
 </Note>
 
 ---
@@ -179,16 +179,12 @@ Bio      = Scribe.String("", { MaxLength = 200 }),
 
 ### `Scribe.Bool(default)` → `boolean`
 
-Declares a boolean field with a `Toggle` mutator.
+Declares a boolean field. Plain Lua `true` or `false` in a template also declares a boolean field; `Scribe.Bool` is explicit.
 
 ```lua
-TutorialDone = false,         -- plain Lua boolean works for simple fields
-IsPremium    = Scribe.Bool(false), -- use this when you need explicit typing
+TutorialDone = false,              -- plain Lua boolean works for simple fields
+IsPremium    = Scribe.Bool(false), -- explicit form
 ```
-
-<Note>
-  Plain Lua `true` or `false` in a template also declares a boolean field. `Scribe.Bool` is useful when you want the explicit declarator syntax for clarity.
-</Note>
 
 <ParamField body="default" type="boolean" required>Initial value.</ParamField>
 
@@ -196,7 +192,7 @@ IsPremium    = Scribe.Bool(false), -- use this when you need explicit typing
 
 ### `Scribe.Flags(members)` → `Flags`
 
-A fixed set of named booleans stored as one field (up to 32 members). Members are addressed by name using `Enable`, `Disable`, `Has`, `Toggle`, `Count`, and `Clear`.
+A fixed set of named booleans stored as one field (up to 32 members). Members are addressed by name using `Enable`, `Disable`, `Has`, `Toggle`, and `Clear`.
 
 ```lua
 Settings = Scribe.Flags({ "Music", "Sfx", "TutorialDone" }),
@@ -237,6 +233,8 @@ All Roblox datatype fields store and replicate as compact packed buffers. `Get`/
 ```lua
 Scribe.Vector3(default: Vector3)
 Scribe.Vector2(default: Vector2)
+Scribe.Vector3int16(default: Vector3int16)
+Scribe.Vector2int16(default: Vector2int16)
 Scribe.Color3(default: Color3)
 Scribe.BrickColor(default: BrickColor)
 Scribe.UDim(default: UDim)
@@ -274,7 +272,7 @@ Allows a leaf field to be legitimately absent. The inner declarator's default is
 Nickname = Scribe.Optional(Scribe.String("", { MaxLength = 20 })),
 ```
 
-<ParamField body="inner" type="T" required>A scalar declarator supplying type and bounds. Containers, `Timed`, and `Dynamic` are not allowed inside `Optional`.</ParamField>
+<ParamField body="inner" type="T" required>A scalar declarator supplying type and bounds.</ParamField>
 
 ---
 
@@ -302,7 +300,7 @@ PlacedFurniture = Scribe.ArrayOf({
       Refuses growth past this cap. An already-oversized container remains writable, so a rolling deploy is safe.
     </ParamField>
     <ParamField body="Evict" type='"Front" | "Back"'>
-      Requires `MaxItems`. Names the end that a `Insert` at the cap drops from.
+      Requires `MaxItems`. Names the end that an `Insert` at the cap drops from.
     </ParamField>
   </Expandable>
 </ParamField>
@@ -380,8 +378,8 @@ Wrappers modify how a field is persisted, replicated, or computed. They can be c
 Declares a field with an expiry. Set it with `Value.SetTimed(value, seconds)`; it auto-clears back to `default` when the timer lapses and fires `Changed`.
 
 ```lua
-ActiveBoost = Scribe.Timed(""),     -- cleared when the boost expires
-LastDaily   = Scribe.Timed(0),      -- a timestamp cleared after 24 h
+ActiveBoost = Scribe.Timed(""),  -- cleared when the boost expires
+LastDaily   = Scribe.Timed(0),   -- a timestamp cleared after 24 h
 ```
 
 <ParamField body="default" type="T" required>The value the field resets to when the timer lapses.</ParamField>
@@ -393,8 +391,8 @@ LastDaily   = Scribe.Timed(0),      -- a timestamp cleared after 24 h
 Marks a field server-only. It persists and is readable on the server but is never replicated to any client. The field is absent from the client's accessor type — reading it from a `LocalScript` is a type error.
 
 ```lua
-AdminNotes  = Scribe.ServerOnly(Scribe.String("")),
-BanReason   = Scribe.ServerOnly(Scribe.Optional(Scribe.String(""))),
+AdminNotes = Scribe.ServerOnly(Scribe.String("")),
+BanReason  = Scribe.ServerOnly(Scribe.Optional(Scribe.String(""))),
 ```
 
 <ParamField body="value" type="T" required>Any declarator, including containers and other wrappers.</ParamField>
@@ -419,8 +417,8 @@ Team        = Scribe.Shared(Scribe.Enum("Red", { "Red", "Blue" })),
 Marks a root field session-only: never persisted, resets on every join. Ideal for runtime state like `InCombat` that should not survive a disconnect.
 
 ```lua
-InCombat    = Scribe.Session(false),
-JoinedAt    = Scribe.Session(Scribe.Dynamic(os.time)),
+InCombat = Scribe.Session(false),
+JoinedAt = Scribe.Session(Scribe.Dynamic(os.time)),
 ```
 
 <ParamField body="value" type="T" required>Any declarator. Doubling it up is a startup error.</ParamField>
@@ -466,7 +464,7 @@ These functions and properties are available anywhere you hold the `Scribe` modu
 
 ### `Scribe.Configure(options)`
 
-Sets configuration that belongs to the process rather than to one bundle. Call it once, before constructing any bundle.
+Sets configuration that belongs to the process rather than to one bundle. Call it once, before constructing any bundle. Currently accepts one key.
 
 ```lua
 Scribe.Configure({ AutoSaveInterval = 60 })
@@ -475,6 +473,20 @@ Scribe.Configure({ AutoSaveInterval = 60 })
 <ParamField body="options" type="{ AutoSaveInterval: number? }" required>
   `AutoSaveInterval` sets ProfileStore's process-wide autosave cadence in seconds (floor 15). Calling `Configure` twice with different values, or after a bundle exists, is an error.
 </ParamField>
+
+---
+
+### `Scribe.Short(value, decimals?)` → `string`
+
+Formats a number or `BigValue` with short suffixes such as `"1.5K"`, `"100M"`, `"2.4B"`.
+
+```lua
+local label = Scribe.Short(data.Coins.Get())      -- "1.5M"
+local exact = Scribe.Short(data.Coins.Get(), 0)    -- "2M" (rounded, 0 decimals)
+```
+
+<ParamField body="value" type="number | BigValue" required>A plain number or a `Scribe.Big` value.</ParamField>
+<ParamField body="decimals" type="number">Decimal places, default `2`. Must be a non-negative integer.</ParamField>
 
 ---
 
@@ -495,6 +507,12 @@ local status = Scribe.GetStatus()  -- "Healthy" | "Degraded" | "Outage"
 ### `Scribe.OnStatusChanged` — Signal
 
 Fires with the new `Status` string whenever service health changes. Connect with `:Connect(function(status) ... end)`.
+
+---
+
+### `Scribe.OnIssue` — Signal
+
+Fires for every `Error` or `Fatal` log entry. Wire up developer alerting (Discord webhook, PagerDuty, etc.) from your own game code.
 
 ---
 
@@ -539,7 +557,6 @@ Registers a log sink. Every entry that passes the filter is dispatched to `callb
 
 ```lua
 local disconnect = Scribe.AddLogSink(function(entry)
-    -- forward to your analytics pipeline
     print(entry.Level, entry.Code, entry.Message)
 end, { Level = "Warn" })
 ```
@@ -560,21 +577,31 @@ Cached health for every board in running server bundles. Makes no DataStore requ
 
 ---
 
-### `Scribe.Short(value, decimals?)` → `string`
+### `Scribe.GetMetrics()` → `table`
 
-Formats a number or `BigValue` with short suffixes such as `"1.5K"`, `"100M"`, `"2.4B"`.
-
-```lua
-local label = Scribe.Short(data.Coins.Get())          -- "1.5M"
-local exact = Scribe.Short(data.Coins.Get(), 0)        -- "2M" (rounded, 0 decimals)
-```
-
-<ParamField body="value" type="number | BigValue" required>A plain number or a `Scribe.Big` value.</ParamField>
-<ParamField body="decimals" type="number">Decimal places, default `2`. Must be a non-negative integer.</ParamField>
+A snapshot of internal counters (saves, loads, receipt outcomes, queue depths, …) for admin panels and load tests.
 
 ---
 
-### Named constant tables
+### `Scribe.GetPercentiles()` → `table`
+
+Nearest-rank percentiles (P50, P90, P99) for every distribution metric. Useful for understanding tail latencies that averages hide.
+
+---
+
+### `Scribe.GetProfileKeyPrefix()` → `string`
+
+Returns the `ProfileKeyPrefix` the running server bundle was started with, or `"PLAYER_"` before any bundle is started and on the client.
+
+---
+
+### `Scribe.RegisterAddon(name, actions)` → `Disconnect`
+
+Registers actions an add-on offers to the Scribe Studio plugin. Returns a cleanup function.
+
+---
+
+## Named constant tables
 
 Scribe ships named constant tables so you can branch on reasons without guessing at spellings.
 
@@ -592,6 +619,8 @@ Scribe ships named constant tables so you can branch on reasons without guessing
 | `Scribe.LogCategory` | `LogCategory` | `Persistence`, `Replication`, `Transport`, `Commands`, `Leaderboards`, `Monetization`, `Gifting`, `Integrity`, `Lifecycle`, `Derived`, `Exchanges` |
 | `Scribe.LeaderboardStatus` | `LeaderboardStatus` | `Starting`, `Healthy`, `Degraded` |
 | `Scribe.Visibility` | `Visibility` | `Replicated`, `ServerOnly`, `Shared` |
+| `Scribe.OpKind` | `OpKind` | `Init`, `Set`, `Insert`, `Remove`, `Clear` |
+| `Scribe.RequestFailed` | `{}` | Sentinel appended to every framework refusal from `Client.Request` |
 
 ```lua
 -- Branching without string literals:

@@ -1,7 +1,7 @@
 ---
 title: "Scribe Type Reference: Options, Results, and Events"
 sidebarTitle: "Types"
-description: "All exported Scribe types: setup, session, monetization, leaderboards, exchanges, gifting, diagnostics, requests, and transport."
+description: "All exported Scribe types: setup options, session lifecycle, monetization, leaderboards, exchanges, gifting, diagnostics, transport, and BigValue."
 ---
 
 This page documents every named type exported from the Scribe module. Types are used in function signatures throughout the [Server](/api/server), [Client](/api/client), and [Value](/api/value) APIs. Where a type appears in a `<ParamField>` or `<ResponseField>` on another page, you can look up its exact shape here.
@@ -80,7 +80,7 @@ The full configuration table passed to `Scribe(options)`. Only three fields are 
 
 ### `MigrationContext`
 
-Passed to each migration callback and to `ImportLegacyData`. Provides the budget-aware save primitive.
+Passed to each migration callback. Provides a budget-aware save primitive.
 
 <ResponseField name="AwaitBudget" type="(requestType: string) -> ()">
   Yields until a DataStore budget token is available for `requestType`. Use inside migration callbacks that need to make additional DataStore calls.
@@ -260,8 +260,6 @@ Configuration for one board declared in `ScribeOptions.Leaderboards`.
 <ResponseField name="Scope" type='"Global" | "Server"?'>
   `"Server"` ranks players on this server only, with no store. `"Global"` (default) uses OrderedDataStore.
 </ResponseField>
-<ResponseField name="RefreshInterval" type="number?">Approximate seconds between store reads. Default `60`, floor `60`.</ResponseField>
-<ResponseField name="WriteInterval" type="number?">Minimum seconds between per-player score writes. Default `30`, minimum `1`.</ResponseField>
 
 ---
 
@@ -342,7 +340,6 @@ One in-flight exchange record returned by `Server.Exchange.Open`.
 <ResponseField name="Partner" type="number">The other player's UserId.</ResponseField>
 <ResponseField name="Staked" type="{ ExchangeLeg }">What this player gave (held in escrow).</ResponseField>
 <ResponseField name="Owed" type="{ ExchangeLeg }">What this player is owed.</ResponseField>
-<ResponseField name="Since" type="number">Unix timestamp when the exchange began.</ResponseField>
 
 ---
 
@@ -477,41 +474,54 @@ Named constants are on `Scribe.RequestReason`.
   A handler may return `false, "timeout"` of its own. Always test the third return value against `Scribe.RequestFailed` to distinguish a framework refusal from a handler message.
 </Note>
 
+### `RequestFailed`
+
+The sentinel value (`{}`) appended as a third return to every framework refusal from `Client.Request`. It is a frozen empty table — its identity, not its contents, is what you test against. Accessible as `Scribe.RequestFailed`.
+
+```lua
+local ok, reason, failed = Data.Request("BuyItem", itemId)
+if failed == Scribe.RequestFailed then
+    -- Scribe refused (rate limit, not-ready, etc.)
+else
+    -- Your handler returned false
+end
+```
+
 ---
 
 ## Value Types
 
 ### `BigValue`
 
-The object returned by `Get()` on a `Scribe.Big` field. Supports full arithmetic, comparison, and display.
+The object returned by `Get()` on a `Scribe.Big` field. Supports full arithmetic, comparison, and display. Arithmetic operators `+`, `-`, `*`, `/`, unary `-`, and comparisons `<`, `<=`, `==` are also supported via metamethods on any `BigValue | number | string` operand pair.
 
 <ResponseField name="M" type="number">Mantissa of the internal representation.</ResponseField>
 <ResponseField name="E" type="number">Exponent of the internal representation.</ResponseField>
 <ResponseField name="Short" type="(self, decimals?: number) -> string">Formats as `"1.5K"`, `"100M"`, etc.</ResponseField>
-<ResponseField name="ToNumber" type="(self) -> number">Converts to a plain Lua number (may lose precision).</ResponseField>
+<ResponseField name="ToNumber" type="(self) -> number">Converts to a plain Lua number (may lose precision past `2^53`).</ResponseField>
 <ResponseField name="Log10" type="(self) -> number">Returns the base-10 logarithm.</ResponseField>
+<ResponseField name="Pow" type="(self, exp: number) -> BigValue">Raises to a power.</ResponseField>
 <ResponseField name="Add" type="(self, other: BigValue | number | string) -> BigValue"></ResponseField>
 <ResponseField name="Subtract" type="(self, other: BigValue | number | string) -> BigValue"></ResponseField>
 <ResponseField name="Multiply" type="(self, other: BigValue | number | string) -> BigValue"></ResponseField>
 <ResponseField name="Divide" type="(self, other: BigValue | number | string) -> BigValue"></ResponseField>
-<ResponseField name="Pow" type="(self, exp: number) -> BigValue"></ResponseField>
-<ResponseField name="Negate" type="(self) -> BigValue"></ResponseField>
+<ResponseField name="Negate" type="(self) -> BigValue">Returns the negated value.</ResponseField>
 <ResponseField name="Compare" type="(self, other: BigValue | number | string) -> number">Returns negative, zero, or positive.</ResponseField>
 <ResponseField name="Equals" type="(self, other: BigValue | number | string) -> boolean"></ResponseField>
-
-Arithmetic operators `+`, `-`, `*`, `/`, unary `-`, and comparisons `<`, `<=`, `==` are also supported via metamethods on any `BigValue | number | string` operand pair.
 
 ---
 
 ### `EconomyMeta`
 
-The optional tag passed to `Value.Increment` and `Value.Decrement` to auto-emit a `LogEconomyEvent`.
+The optional tag passed to `Value.Increment` and `Value.Decrement` to auto-emit a `LogEconomyEvent`. All fields are optional; an untagged `Increment` writes the value without emitting an event.
 
 <ResponseField name="Flow" type='"Source" | "Sink"?'>Default: `Increment` → `Source`, `Decrement` → `Sink`.</ResponseField>
-<ResponseField name="TransactionType" type="Enum.AnalyticsEconomyTransactionType | string?">Default `"Gameplay"`.</ResponseField>
+<ResponseField name="TransactionType" type="Enum.AnalyticsEconomyTransactionType | string?">Default `"Gameplay"`. An `EnumItem`'s `.Name` is used when an `EnumItem` is passed.</ResponseField>
 <ResponseField name="ItemSku" type="string?">The item the currency was spent on or gained from.</ResponseField>
 <ResponseField name="Currency" type="string?">Override the logged currency label. Default: the field name.</ResponseField>
 <ResponseField name="Fields" type="{ [string]: any }?">Per-event custom-field values keyed by declared field name.</ResponseField>
+<ResponseField name="Source" type="string?">Legacy alias for `TransactionType`.</ResponseField>
+<ResponseField name="Item" type="string?">Legacy alias for `ItemSku`.</ResponseField>
 
 ---
 
@@ -519,7 +529,7 @@ The optional tag passed to `Value.Increment` and `Value.Decrement` to auto-emit 
 
 ### `ScribeTransport`
 
-The interface for a custom transport adapter passed to `ScribeOptions.Transport`. Implement the server-side and client-side halves on one object.
+The interface for a custom transport adapter passed to `ScribeOptions.Transport`. Implement both the server-side and client-side halves on one object.
 
 <ResponseField name="Name" type="string" required>Human-readable name for logging and diagnostics.</ResponseField>
 <ResponseField name="MaxFrameBytes" type="number?">
