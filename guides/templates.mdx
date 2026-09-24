@@ -1,0 +1,352 @@
+---
+title: "Declaring Your Data Template with Scribe"
+sidebarTitle: "Templates"
+description: "Learn how to declare player data templates using Scribe's full declarator set: scalars, containers, flags, timers, computed fields, and server-only data."
+---
+
+The **template** is the single source of truth for your player data. It is a plain Lua table whose values describe each field's type, default, and rules. Scribe reads this table when you call `Scribe({...})` and uses it to generate typed accessors, validate writes, pack data for the wire, and seed new profiles. You only write the template once.
+
+## Plain Values vs. Declarators
+
+The simplest template uses plain Lua values:
+
+```lua
+local template = {
+    Coins = 0,
+    Settings = {
+        Music = true,
+    },
+}
+```
+
+A plain value tells Scribe the field's type (inferred as `number` or `boolean`) and its starting value, with no validation rules. For many fields that is exactly what you want.
+
+A **declarator** like `Scribe.Int(0, { Min = 0 })` does the same thing but adds rules: round non-integer writes, clamp out-of-range values, and pack the field to a narrower wire width when bounds are declared. Use declarators where your game needs them, and leave the rest as plain values.
+
+## The Full Declarator Reference
+
+<Accordion title="Scalar declarators">
+
+### `Scribe.Int`
+
+Declares a whole-number field. Non-integer writes are rounded; out-of-range writes are clamped (or rejected under `BoundsPolicy = "Reject"`). Bounded ints pack to a smaller wire width.
+
+```lua
+Coins = Scribe.Int(0, { Min = 0 }),
+Level = Scribe.Int(1, { Min = 1, Max = 100 }),
+```
+
+### `Scribe.Number`
+
+Declares a floating-point field with optional bounds and an optional narrowed wire form. `Min` and `Max` must be finite. Use `Precision` to reduce the wire width at the cost of a small rounding error on the client side.
+
+```lua
+Accuracy = Scribe.Number(0, { Min = 0, Max = 1, Precision = 0.001 }), -- 2 bytes on the wire
+Health   = Scribe.Number(100, { Min = 0, Max = 100, Precision = 0.5 }), -- 1 byte
+```
+
+### `Scribe.String`
+
+Declares a string field with an optional byte-length cap. `MaxLength` is a **byte** budget — a three-character CJK name is 9 bytes. Over-long writes are truncated on a character boundary.
+
+```lua
+DisplayName = Scribe.String("", { MaxLength = 64 }),
+```
+
+### `Scribe.Enum`
+
+Declares a string field restricted to a fixed set of members. Writes outside the set are always rejected. The value packs to a single byte.
+
+```lua
+local RARITIES = { "Common", "Rare", "Epic", "Legendary" }
+Rarity = Scribe.Enum("Common", RARITIES),
+```
+
+### `Scribe.Big`
+
+A number with unlimited range, for currencies that run past `2^53`. Carries about 15 significant digits at any magnitude. Bounds past `1.8e308` must be written as numeric strings.
+
+```lua
+Essence = Scribe.Big(0, { Min = 0, Max = "1e600" }),
+```
+
+`Get()` returns a `BigValue`, not a plain number. Use `Increment`, `Add`, `Multiply`, `Divide`, `Compare`, and `Short()` on it.
+
+</Accordion>
+
+<Accordion title="Named booleans and sets">
+
+### `Scribe.Flags`
+
+Stores up to 32 named booleans as a single field. Addressed by member name, not as accessor children.
+
+```lua
+Settings = Scribe.Flags({ "Music", "Sfx", "TutorialDone" }),
+```
+
+```lua
+data.Settings.Enable("Music")
+data.Settings.Has("Music")    -- true
+data.Settings.Toggle("Sfx")
+data.Settings.Count()         -- number of enabled flags
+```
+
+### `Scribe.SetOf`
+
+A collection of unique scalar entries. Use it where you would otherwise keep a dictionary of `true` values, such as a set of unlocked regions.
+
+```lua
+Unlocked = Scribe.SetOf(Scribe.String("", { MaxLength = 32 }), { MaxItems = 200 }),
+```
+
+```lua
+data.Unlocked.Add("AshfallRidge")
+data.Unlocked.Has("AshfallRidge")    -- true
+data.Unlocked.Remove("AshfallRidge")
+```
+
+</Accordion>
+
+<Accordion title="Containers">
+
+### `Scribe.ArrayOf`
+
+A typed array whose elements have a declared shape. Supports `MaxItems` and optional eviction from either end.
+
+```lua
+RecentRuns = Scribe.ArrayOf({ Score = Scribe.Int(0) }, { MaxItems = 10, Evict = "Front" }),
+```
+
+### `Scribe.DictOf`
+
+A string-keyed dictionary whose values have a declared shape. Keys exist only once something writes them.
+
+```lua
+Inventory = Scribe.DictOf({
+    Qty    = Scribe.Int(1, { Min = 1, Max = 999 }),
+    Rarity = Scribe.Enum("Common", { "Common", "Rare", "Epic", "Legendary" }),
+}, { MaxKeys = 200 }),
+```
+
+### `Scribe.MapOf`
+
+A dictionary whose key type is explicitly declared as `"integer"` or `"string"`. Integer keys come back as numbers even though the DataStore stores them as strings.
+
+```lua
+Friends = Scribe.MapOf("integer", { Name = Scribe.String("", { MaxLength = 32 }) }),
+data.Friends[ava.UserId].Name.Set("Ava")  -- no tostring needed
+```
+
+</Accordion>
+
+<Accordion title="Wrapper declarators">
+
+### `Scribe.Timed`
+
+Declares a field with an expiry. Set it with `field.SetTimed(value, seconds)`; it auto-clears back to `default` when the timer lapses and fires `Changed`.
+
+```lua
+LastDaily  = Scribe.Timed(false),
+ActiveBuff = Scribe.Timed(""),
+```
+
+```lua
+data.LastDaily.SetTimed(true, 86400)       -- claim daily, expires in 24 h
+data.LastDaily.IsActive()                  -- true if unexpired
+data.LastDaily.TimeRemaining()             -- seconds left
+```
+
+### `Scribe.ServerOnly`
+
+Marks a root field (or a nested subtree) as server-only. The field persists and is readable on the server but is **never** replicated to any client. Its type is absent from the client accessor, making a client-side read a compile-time error.
+
+```lua
+AdminFlags = Scribe.ServerOnly({ Banned = false, Muted = false }),
+SecretSeed = Scribe.ServerOnly(Scribe.Int(0)),
+```
+
+### `Scribe.Derived`
+
+Declares a read-only field computed from other declared fields. It is never persisted, never writable, and is recomputed whenever an input changes.
+
+```lua
+local function levelForXp(xp: number): number
+    return math.min(100, math.floor(xp / 1000) + 1)
+end
+
+Level = Scribe.Derived(Scribe.Int(1, { Min = 1, Max = 100 }), { "Xp" }, levelForXp),
+```
+
+The first argument is an ordinary declarator providing type and bounds. `inputs` are dot-separated paths to scalar fields, passed to `compute` in declaration order. Cycles are detected and rejected at startup.
+
+### `Scribe.Optional`
+
+Declares a field that may legitimately be absent. Has no default — `Get()` returns `nil` until something writes it, and `Set(nil)` removes it.
+
+```lua
+Nickname = Scribe.Optional(Scribe.String("", { MaxLength = 20 })),
+```
+
+### `Scribe.Dynamic`
+
+Declares a field whose default is computed once per profile rather than frozen at server start. Pass the factory function itself.
+
+```lua
+CreatedUnix = Scribe.Dynamic(os.time),
+JoinedAt    = Scribe.Dynamic(function() return DateTime.now() end),
+```
+
+</Accordion>
+
+<Accordion title="Roblox datatype declarators">
+
+Scribe packs Roblox datatypes into compact buffers automatically. Declare them with their own declarators and your code only ever sees the real datatype.
+
+```lua
+Checkpoint  = Scribe.Vector3(Vector3.zero),
+HomePortal  = Scribe.CFrame(CFrame.identity),
+FavColour   = Scribe.Color3(Color3.fromRGB(255, 120, 0)),
+CreatedAt   = Scribe.DateTime(DateTime.now()),
+```
+
+The full set: `Vector3`, `Vector2`, `Vector3int16`, `Vector2int16`, `CFrame`, `Color3`, `BrickColor`, `UDim`, `UDim2`, `Rect`, `NumberRange`, `NumberSequence`, `ColorSequence`, `DateTime`, `EnumItem`, `Font`, `PhysicalProperties`.
+
+See the [Datatypes guide](/guides/roblox-ts) for packing details and the `Scribe.CFrame` precision option.
+
+</Accordion>
+
+## A Realistic Template
+
+The following template is the **Emberfall** example used throughout Scribe's feature guides. It demonstrates the most common declarators working together in an RPG-style game:
+
+```lua
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Scribe = require(ReplicatedStorage.Packages.Scribe)
+
+local RARITIES = { "Common", "Rare", "Epic", "Legendary" }
+
+-- Derived fields must be pure: the same inputs always produce the same output.
+local function levelForXp(xp: number): number
+    return math.min(100, math.floor(xp / 1000) + 1)
+end
+
+local template = {
+    -- ── Currency ──────────────────────────────────────────────────────────
+    Coins = Scribe.Int(0, { Min = 0 }),
+    Gems  = Scribe.Int(0, { Min = 0 }),
+
+    -- ── Progression ───────────────────────────────────────────────────────
+    -- Xp is stored; Level is computed from it and never persisted.
+    Xp    = Scribe.Int(0, { Min = 0 }),
+    Level = Scribe.Derived(Scribe.Int(1, { Min = 1, Max = 100 }), { "Xp" }, levelForXp),
+
+    -- ── Inventory ─────────────────────────────────────────────────────────
+    -- Keys are item IDs; each entry carries a quantity and a rarity.
+    Inventory = Scribe.DictOf({
+        Qty    = Scribe.Int(1, { Min = 1, Max = 999 }),
+        Rarity = Scribe.Enum("Common", RARITIES),
+    }, { MaxKeys = 200 }),
+
+    -- ── Settings ──────────────────────────────────────────────────────────
+    -- Up to 32 named booleans stored as a single field.
+    Settings = Scribe.Flags({ "Music", "Sfx", "TutorialDone" }),
+
+    -- ── Cooldowns ─────────────────────────────────────────────────────────
+    -- Clears itself back to false when the 86400-second timer lapses.
+    LastDaily = Scribe.Timed(false),
+
+    -- ── Statistics ────────────────────────────────────────────────────────
+    Stats = {
+        Deaths   = Scribe.Int(0, { Min = 0 }),
+        Playtime = Scribe.Int(0, { Min = 0 }),
+    },
+
+    -- ── Server-only ───────────────────────────────────────────────────────
+    -- Never replicated; absent from the client's accessor type entirely.
+    AdminData = Scribe.ServerOnly({
+        Banned = false,
+        Muted  = false,
+    }),
+}
+
+return Scribe({
+    Template          = template,
+    ProfileStoreIndex = "EmberfallPlayerData",
+    ProfileKeyPrefix  = "PLAYER_",
+    Mode              = "Mock",
+})
+```
+
+## Required Options
+
+Every call to `Scribe({...})` must include these three options:
+
+<ParamField path="Template" type="table" required>
+  A Lua table of field names to default values or declarators. Nested tables become nested accessor trees. The table is read at startup; mutations after `Scribe()` returns have no effect.
+</ParamField>
+
+<ParamField path="ProfileStoreIndex" type="string" required>
+  The DataStore name Scribe uses to open the ProfileStore. Keep this stable — changing it after launch moves all player data to a new store and existing saves become unreachable.
+</ParamField>
+
+<ParamField path="ProfileKeyPrefix" type="string" required>
+  The string prepended to each player's UserId to form their DataStore key (e.g. `"PLAYER_"` produces `"PLAYER_12345678"`). Keep this stable for the same reason as `ProfileStoreIndex`.
+</ParamField>
+
+## Names Scribe Will Not Accept
+
+Two categories of field name cause a startup error rather than a subtle runtime bug:
+
+- **Accessor method names** at any depth: `Get`, `Set`, `Increment`, `Count`, `Insert`, `Remove`, `Find`, `Has`, `Clear`, and others. A field with one of these names is shadowed by the method and unreachable.
+- **Client API names at the root level**: names like `Owns`, `Request`, `Mock`, `Raw`, `IsReady`, and `Stop` collide with the client object's own properties or methods.
+
+The reserved root `_Scribe` and any name beginning with it are refused outright.
+
+## Annotating Your Own Functions
+
+The accessor tree's type is `Scribe.PlayerData<T>`, where `T` is `typeof(template)`. Use this to annotate functions that accept a player's data object:
+
+```lua
+export type Template = typeof(template)  -- in the module that calls Scribe()
+
+type EmberfallData = Scribe.PlayerData<Template>
+
+local function onPlayerReady(player: Player, data: EmberfallData)
+    data.Coins.Increment(50)
+    data.Settings.Enable("Music")
+end
+```
+
+Use `Scribe.ServerData<T>` and `Scribe.ClientData<T>` to name the whole `Data` object rather than one player's tree.
+
+<Tip>
+  If Luau reports "Code is too complex to typecheck" on a large template, name the options table and cast the call:
+
+  ```lua
+  local options: Scribe.ScribeOptions<typeof(template)> = {
+      Template = template,
+      ProfileStoreIndex = "MyGameData",
+      ProfileKeyPrefix = "PLAYER_",
+  }
+  local Data = (Scribe :: any)(options).Server :: Scribe.ServerData<typeof(template)>
+  ```
+
+  The options literal is still checked against your template, and `Data` gets the same type the normal call would produce. This extends the limit from ~32 roots to past 256.
+</Tip>
+
+## Where to Next
+
+<CardGroup cols={2}>
+  <Card title="Values" icon="pen" href="/guides/values">
+    The full set of accessor methods: Get, Set, Increment, Observe, and container operations.
+  </Card>
+  <Card title="Containers" icon="box" href="/guides/containers">
+    Deep dive into ArrayOf, DictOf, MapOf, SetOf, and element schemas.
+  </Card>
+  <Card title="Lifecycle" icon="rotate" href="/guides/lifecycle">
+    OnPlayerInit, save hooks, migration steps, and how to handle raw profile data.
+  </Card>
+  <Card title="Replication" icon="arrows-rotate" href="/guides/replication">
+    ServerOnly, Shared, and Session visibility wrappers and their interaction.
+  </Card>
+</CardGroup>

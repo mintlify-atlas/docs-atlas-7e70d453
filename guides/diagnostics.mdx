@@ -1,0 +1,355 @@
+---
+title: "Diagnosing and Monitoring Scribe in Production"
+sidebarTitle: "Diagnostics"
+description: "Monitor DataStore health, inspect log entries by stable code, track metrics and budgets, and pipe alerts to your backend — all without sending anything by default."
+---
+
+Scribe records every significant event with a stable code, tracks whether the DataStore backend is healthy, and keeps a running set of counters you can put on an admin panel. Nothing is sent anywhere automatically — you decide what leaves the server and where it goes. This page covers how to read those signals, what they mean, and how to wire them to your alerting setup.
+
+## Alerting on What Matters
+
+The two signals you should set up first are `OnIssue` for serious failures and `OnStatusChanged` for service health. Together they cover the cases where you need to act fast.
+
+```lua
+-- ServerScriptService/Diagnostics.server.luau
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Scribe = require(ReplicatedStorage.Packages.Scribe)
+
+-- Fires for every Error and Fatal log entry, whatever produced it.
+Scribe.OnIssue:Connect(function(entry)
+    warn(`[Game] {entry.Code}: {entry.Message}`)
+end)
+
+-- "Healthy", "Degraded" or "Outage" — fires only when the verdict moves.
+Scribe.OnStatusChanged:Connect(function(status)
+    if status ~= "Healthy" then
+        warn(`[Game] data service is {status}`)
+    end
+end)
+```
+
+`OnIssue` fires for every `Error` and `Fatal` log entry — a failed profile load, a tripped wipe guard, and a broken migration all land in one place. `OnStatusChanged` fires only when the health verdict actually changes, so it stays quiet on a healthy server. Replace the `warn` calls with whatever alerting system your game already uses.
+
+## Service Health
+
+`Scribe.GetStatus()` returns `"Healthy"`, `"Degraded"`, or `"Outage"`. The verdict is also broadcast to clients so you can show a notice in your UI when saves are struggling.
+
+<Tabs>
+  <Tab title="Server">
+    ```lua
+    local status = Scribe.GetStatus()
+    print(`Data service: {status}`)
+    ```
+  </Tab>
+  <Tab title="Client">
+    ```lua
+    -- StarterPlayerScripts/StatusUI.client.luau
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local Data = require(ReplicatedStorage.Shared.GameData).Client
+
+    Data.OnServiceStatus:Connect(function(status)
+        saveWarningLabel.Visible = status ~= "Healthy"
+        saveWarningLabel.Text = "Your progress may save late."
+    end)
+    ```
+  </Tab>
+</Tabs>
+
+<Accordion title="What Degraded and Outage mean for your game">
+Scribe reports `Degraded` and broadcasts it, then behaves exactly as before. It is a signal for your game to act on: show a notice, pause the in-game shop, stop handing out currency.
+
+Only `Outage` gates anything inside Scribe — and only four things: receipts, gifts, restores, and erases. Everything else keeps running.
+
+`Outage` lifts back to `Degraded` on its own once a full failure window passes with no failures at all. Returning to `Healthy` requires a streak of successful operations, because silence is not evidence that anything worked.
+</Accordion>
+
+### Customising the Health Thresholds
+
+The `StatusThresholds` option controls when Scribe transitions between states:
+
+```lua
+Scribe({
+    Template = template,
+    ProfileStoreIndex = "PlayerData",
+    ProfileKeyPrefix  = "PLAYER_",
+
+    StatusThresholds = {
+        FailWindow      = 60,   -- seconds the error window spans
+        FailCount       = 5,    -- failures within the window to reach Degraded
+        RecoverStreak   = 3,    -- consecutive successes needed to reach Healthy
+    },
+})
+```
+
+## Reading the Log Ring
+
+Every log entry is a plain table: `{ At, Level, Category, Code, Message, Context }`.
+
+<ResponseField name="At" type="number">
+  Unix timestamp when the entry was recorded.
+</ResponseField>
+<ResponseField name="Level" type='"Debug" | "Info" | "Warn" | "Error" | "Fatal"'>
+  Severity of the entry.
+</ResponseField>
+<ResponseField name="Category" type="LogCategory">
+  Which subsystem produced the entry — `"Persistence"`, `"Replication"`, `"Transport"`, `"Commands"`, `"Leaderboards"`, `"Monetization"`, `"Gifting"`, `"Integrity"`, `"Lifecycle"`, `"Derived"`, or `"Exchanges"`.
+</ResponseField>
+<ResponseField name="Code" type="LogCode">
+  A stable string identifier such as `PROFILE_LOAD_FAIL` or `WIPE_GUARD_TRIPPED`. **Always branch on `Code`** — it never changes between versions. Never branch on `Message`, which is prose and can be reworded at any time.
+</ResponseField>
+<ResponseField name="Message" type="string">
+  Human-readable description for display. Do not parse or match on this field.
+</ResponseField>
+<ResponseField name="Context" type="{ [string]: any }?">
+  Optional structured data relevant to the entry — player IDs, keys, counts, and so on.
+</ResponseField>
+
+### Pulling Recent Logs
+
+`Scribe.GetRecentLogs(filter?)` returns entries from the in-memory ring, oldest first (so the newest entry is last). The ring holds up to 512 entries by default; increase it with the `LogRingSize` option.
+
+```lua
+-- Pull the last 20 load failures on demand.
+local recent = Scribe.GetRecentLogs({ Code = "PROFILE_LOAD_FAIL", Limit = 20 })
+
+for _, entry in recent do
+    print(entry.At, entry.Code, entry.Message)
+end
+```
+
+<Note>
+  `Code`, `Level`, and `Category` are typed string unions, so your editor autocompletes them both as filter values and on `entry` inside the callback. Use `Scribe.LogLevel.Warn` and `Scribe.LogCategory.Persistence` for the named constants.
+</Note>
+
+### Adding a Log Sink
+
+`Scribe.AddLogSink(callback, opts?)` registers a function that receives every matching log entry as it is produced, and returns a disconnect function.
+
+```lua
+-- Forward Error and Fatal entries to your analytics backend.
+local detach = Scribe.AddLogSink(function(entry)
+    MyBackend:Report(entry)
+end, { Level = "Error", MaxQueued = 128 })
+
+-- Later, when you no longer need the sink:
+-- detach()
+```
+
+<ResponseField name="Level" type="LogLevel?">
+  Minimum severity to deliver. Defaults to the configured `LogLevel`.
+</ResponseField>
+<ResponseField name="MaxQueued" type="number?">
+  Maximum entries waiting to be delivered. Default 128, maximum 4096. On overflow, an incoming entry replaces an older lower-severity entry if possible; otherwise the incoming entry is dropped.
+</ResponseField>
+
+<Accordion title="When to keep the detach function">
+`AddLogSink` returns a function that removes the sink. Calling it twice is a no-op.
+
+Keep it for a hot-reloaded module, a bundle you stop, or a test. Detaching clears the queue; a callback already running may finish. Registering the same function twice creates two independent sinks.
+</Accordion>
+
+<Warning>
+  Logs are diagnostics, not a durable transaction ledger. A slow or failing sink does not block Scribe, and entries can be dropped when a queue is full. Watch `LogSinkDropped` and `LogSinkErrors` in metrics.
+</Warning>
+
+### Log Level Configuration
+
+Two options control what gets recorded:
+
+| Option | Purpose |
+| --- | --- |
+| `LogLevel` | Minimum severity for the console and default sinks. Defaults to `"Warn"` in production and `"Debug"` in Studio. |
+| `LogRingLevel` | Minimum severity retained in the ring. Adjust this independently to keep more history without flooding the console. |
+| `LogRingSize` | Number of entries the ring holds. Default 512. |
+
+## DataStore Budget
+
+`Scribe.GetBudgetSnapshot()` returns the current DataStore budget without making a request:
+
+```lua
+local budget = Scribe.GetBudgetSnapshot()
+print(`GetAsync budget: {budget.Available.GetAsync} / {budget.Budgets.GetAsync}`)
+print(`Snapshot taken at: {budget.At}`)
+```
+
+<ResponseField name="Available" type="{ [string]: number }">
+  Remaining budget per request type right now.
+</ResponseField>
+<ResponseField name="Budgets" type="{ [string]: number }">
+  Maximum budget per request type.
+</ResponseField>
+<ResponseField name="At" type="number">
+  Unix timestamp when the snapshot was taken.
+</ResponseField>
+
+<Note>
+  Ordinary budget exhaustion makes a request **wait** rather than fail. A heavily throttled server can show zero `DataStoreErrors_Throttled` while `GetBudgetSnapshot` shows a depleted budget. Use both signals together.
+</Note>
+
+## Metrics for an Admin Panel
+
+`Scribe.GetMetrics()` returns a flat snapshot. Plain counters and gauges are numbers. Timing and size distributions are `{ Count, Average, Max }` records. A key exists only once something has emitted it, so treat a missing key as zero.
+
+```lua
+local metrics = Scribe.GetMetrics()
+print(`sessions {metrics.ActiveSessions}`)
+print(`saves ok {metrics.SavesOk}, failed {metrics.SavesFailed}`)
+```
+
+<Accordion title="Key metrics to put on a panel first">
+
+| Key | Kind | Meaning |
+| --- | --- | --- |
+| `ActiveSessions` | gauge | Profiles held on this server right now |
+| `ProfilesLoaded`, `ProfileLoadFailures` | counter | Loads that succeeded, and loads that did not |
+| `ProfileLoadDuration` | distribution | Seconds per profile-store acquisition attempt, including failures |
+| `SavesOk`, `SavesFailed` | counter | Save outcomes, counted once per save |
+| `SaveDuration` | distribution | Seconds per save |
+| `ProfileSize` | distribution | Estimated bytes of the last saved data payload |
+| `HealthStatus` | gauge | `0` Healthy, `1` Degraded, `2` Outage |
+| `DataStoreErrors` | counter | DataStore errors against this bundle's store, counted per attempt |
+| `WipeGuardTrips`, `Anomalies` | counter | Integrity events |
+| `BytesOut` | counter | Bytes the transport accepted, summed over every recipient |
+| `LogSinkDropped`, `LogSinkErrors` | counter | Entries lost to full sink queues, and callbacks that failed |
+
+</Accordion>
+
+### Percentiles
+
+`Scribe.GetPercentiles()` returns `{ P50, P90, P99, Samples, Age, Window }` for every distribution over a rolling window of the most recent 256 samples.
+
+```lua
+local saveDuration = Scribe.GetPercentiles().SaveDuration
+if saveDuration and saveDuration.P99 > 2 then
+    warn(`Slowest saves are taking {saveDuration.P99}s`)
+end
+```
+
+<Tip>
+  An average over thousands of fast saves will not move when one save is slow — but that slow save is the one a player is waiting on. Use P99 from `GetPercentiles`, not the average from `GetMetrics`.
+</Tip>
+
+## Per-Player Save Info
+
+`Data.GetSaveInfo(player)` returns the per-player save state without a DataStore request. The result is also mirrored to the player, so a "Saved" or "Unsaved changes" indicator in your UI can read the client copy with no round trip.
+
+```lua
+local info = Data.GetSaveInfo(player)
+print(info.LastSaveAt, info.LastResult, info.Dirty, info.Size)
+```
+
+<ResponseField name="LastSaveAt" type="number?">
+  Unix timestamp of the last successful save, or `nil` before the first.
+</ResponseField>
+<ResponseField name="LastResult" type='"Ok" | "Fail" | nil'>
+  Outcome of the most recent save attempt.
+</ResponseField>
+<ResponseField name="Dirty" type="boolean">
+  Whether there are unsaved changes right now.
+</ResponseField>
+<ResponseField name="Size" type="number?">
+  Approximate bytes of the last successful save, or `nil` before the first.
+</ResponseField>
+
+## Leaderboard Health
+
+`Data.GetLeaderboardStatus(name)` reads cached diagnostics for a named board on the server and makes no DataStore request. `Scribe.GetLeaderboardSnapshot()` returns an array of all boards across all active bundles using that Scribe module.
+
+```lua
+-- Inspect one board.
+local status = Data.GetLeaderboardStatus("TopCoins")
+if status then
+    print(status.Status, status.PendingWrites, status.ReadAge)
+end
+
+-- Inspect all boards (used by ScribeTelemetry).
+for _, board in Scribe.GetLeaderboardSnapshot() do
+    if board.Status == "Degraded" then
+        warn(`Board {board.Name} (bundle {board.BundleId}) is degraded`)
+    end
+end
+```
+
+<Note>
+  A broken leaderboard does not stop otherwise healthy purchases. Leaderboard health is separate from profile health.
+</Note>
+
+## Slow Join Diagnostics
+
+For a slow join, read the second return from `Data.GetState(player)` — it identifies load phases such as `AcquiringSession`, `Importing`, and `Initializing`. The `SLOW_LOAD` code reports a join still waiting after ten seconds. `PLAYER_LEAVING_HOOK_SLOW` identifies a game callback that is delaying the player's final save and session release.
+
+```lua
+local state, phase = Data.GetState(player)
+if state == Scribe.SessionState.Loading then
+    print(`Still loading: {phase}`)
+end
+```
+
+## What a Failing DataStore Looks Like
+
+`DataStoreErrors` counts every failed attempt and is joined by one `DataStoreErrors_<Class>` counter per error class:
+
+| Class | Meaning |
+| --- | --- |
+| `Throttled` | The request was dropped because the throttle queue overflowed. |
+| `Failed` | Transient service-side failure. A retry may work. |
+| `Unresolved` | The call timed out and the write **may have landed**. Do not assume it did not. |
+| `Rejected` | Permanently invalid. Every retry fails identically. |
+
+<Accordion title="Why only Throttled changes Scribe's behaviour">
+`Throttled` collapses every throttled key into a single shared problem, so a join rush cannot walk a server to `Outage` on what is really one condition.
+
+`Failed`, `Unresolved`, and `Rejected` are counted, logged, and branch nowhere. Scribe treats them identically — it is your response that differs, which is the whole reason they are told apart.
+</Accordion>
+
+## Replication Counters
+
+These describe what Scribe is putting on the wire. Useful when a join is slow or a template has grown:
+
+<Accordion title="Throughput and bandwidth keys">
+
+| Key | Kind | Meaning |
+| --- | --- | --- |
+| `Handshakes`, `DiffFlushes` | counter | Completed handshakes and flushes of a player's diff queue |
+| `BytesOutPerSend` | distribution | Bytes per outbound frame |
+| `JoinBytes` | distribution | Bytes delivered to one client to complete one handshake |
+| `FramesSent` | counter | Frames handed to the transport, counted per delivery |
+| `FramesFragmented`, `FragmentsSent` | counter | Frames that exceeded `MaxOutboundBytes` and the wire frames they produced |
+| `MirrorResyncs` | counter | Clients whose mirror was rebuilt because a frame was not delivered |
+
+</Accordion>
+
+## Version and Bundle Skew
+
+Print the version from both sides at startup to catch stale copies:
+
+```lua
+-- Run from a server script and from a LocalScript.
+print("Scribe", Scribe.Version)
+```
+
+Skew shows up at the handshake and never as a wrong value. The server refuses to replicate to a mismatched client and logs one of:
+
+- `PROTOCOL_MISMATCH` — the wire layout differs; two different Scribe versions are running.
+- `SCHEMA_MISMATCH` — the wire version matches but the templates diverged; the client derived a different schema hash.
+
+On that client `Data.WaitForData()` returns `false` after its timeout and every field stays at its template default.
+
+## Live Diagnostics in Studio
+
+Everything on this page — the log ring, the health machine, the metrics, and per-flush bandwidth — is rendered as an interactive dock by the Scribe Studio plugin once `StudioHook = true` is in your options. It also lets you simulate outages and profile traffic without waiting for one to happen.
+
+<CardGroup cols={2}>
+  <Card title="Add-ons" icon="puzzle-piece" href="/guides/addons">
+    ScribeTelemetry posts health changes and failures to Discord webhooks.
+  </Card>
+  <Card title="Security" icon="shield" href="/guides/security">
+    Configure WipeGuard, BoundsPolicy, and integrity anomaly alerts.
+  </Card>
+  <Card title="Lifecycle" icon="rotate" href="/guides/lifecycle">
+    Saves, exit hooks, and the shutdown drain that several counters here measure.
+  </Card>
+  <Card title="API: Scribe" icon="code" href="/api/scribe">
+    Full reference for GetStatus, AddLogSink, GetMetrics, and GetBudgetSnapshot.
+  </Card>
+</CardGroup>

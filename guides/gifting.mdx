@@ -1,0 +1,192 @@
+---
+title: "Player-to-Player Gifting in Scribe"
+sidebarTitle: "Gifting"
+description: "Let players gift Robux products to others — including offline recipients — using Scribe's durable intent system, gift credits, and configurable delivery flow."
+---
+
+Gifting in Scribe lets one player buy a developer product for another. Because Roblox has no native "gift this to someone else" API, the mechanic works by recording a durable destination before any Robux moves, then delivering the product's effects whenever the recipient turns up — on any server, even after days offline. You need [Monetization](/guides/monetization) set up first; gifting reuses the same `Products` you already declared.
+
+## Sending a gift
+
+Call `PromptGift` from a server script with the buyer, the product name, and the recipient's `UserId`. The call yields while it writes a durable intent record, then shows the buyer a Robux purchase prompt.
+
+```lua
+local Data = require(ReplicatedStorage.Shared.EmberfallData).Server
+
+local ok, reason = Data.PromptGift(buyer, "GemPack100", recipientUserId)
+if not ok then
+    if reason == Scribe.GiftReason.GiftCooldown then
+        return -- double-click; say nothing
+    elseif reason == Scribe.GiftReason.RecipientAlreadyOwns then
+        showToast(buyer, "They already have that.")
+    else
+        showToast(buyer, reason) -- every other reason is player-readable
+    end
+end
+```
+
+The recipient receives the product's effects exactly as if they had bought it themselves. A `Grant` callback runs; a `Grants` perk is applied. `true` means a prompt was shown (or a held credit was spent) — it does not mean the recipient has their item yet, since grant and delivery are asynchronous.
+
+<Info>
+Intent is saved **before** the Robux prompt appears, because Roblox's receipt does not include the gift recipient. When the paid receipt arrives, Scribe reads the saved destination and delivers to the correct player regardless of what happened between the prompt and the receipt.
+</Info>
+
+## The full gifting flow
+
+<Steps>
+  <Step title="Intent recorded">
+    Scribe writes a durable record of who the gift is for. Fails closed if the write fails — money never moves without a saved destination.
+  </Step>
+  <Step title="Purchase prompt shown">
+    `PromptGift` yields and opens the Roblox purchase dialog. The buyer sees the normal Robux prompt.
+  </Step>
+  <Step title="Receipt handled">
+    When the buyer completes the purchase, Scribe's `ProcessReceipt` handler reads the saved destination and delivers the product to the recipient.
+  </Step>
+  <Step title="Delivery — online or offline">
+    If the recipient is on this server, the grant runs immediately. If they're on another server or offline, Scribe queues a durable message to their profile key, delivered on their next load.
+  </Step>
+</Steps>
+
+## Reacting to delivery
+
+Because delivery can happen on another server or from the offline mailbox, listening to a signal is the only reliable way to react:
+
+```lua
+-- Server, on the recipient's side
+Data.OnGiftReceived:Connect(function(player, info)
+    -- info = { FromUserId: number, Product: string, GiftId: string }
+    announce(player, `{info.FromUserId} sent you a gift!`)
+end)
+```
+
+For questions like "does Ben own VIP now?", use [`OnOwnershipChanged`](/guides/monetization) instead — it covers gift deliveries alongside ordinary purchases.
+
+## Gift credits
+
+Sometimes a buyer's Robux arrive but there is no sensible recipient. Rather than burning the purchase, Scribe issues a **gift credit**: a durable, re-aimable token the buyer can spend on a later `PromptGift` at no charge.
+
+Credits only arise for **perk products** (declared with `Grants` and no `Grant`). A product with a `Grant` callback can deliver real value to anyone, so there is no concept of a wasted delivery for it.
+
+```lua
+-- Fires on the BUYER when a credit is issued
+Data.OnGiftCredit:Connect(function(player, productName)
+    showToast(player, `Your {productName} gift is unclaimed. Pick someone else.`)
+end)
+```
+
+### Reading gift credit balances
+
+```lua
+-- Server
+local credits = Data.GetGiftCredits(player)
+for productName, count in credits do
+    print(`{player.Name} has {count} unclaimed {productName} gift(s)`)
+end
+```
+
+```lua
+-- Client (credits replicate to their owner by default)
+for productName, count in Data.GetGiftCredits() do
+    creditLabel.Text = `{count}x {productName}`
+end
+```
+
+## GiftReason refusal reference
+
+`PromptGift` returns `(false, reason)` for every refusal. All but `InvalidRecipient` are sentences suitable to show the buyer directly.
+
+<ResponseField name="BuyerDataNotLoaded" type="GiftReason">
+  The buyer's profile is not Ready. Show a "try again" message.
+</ResponseField>
+
+<ResponseField name="InvalidRecipient" type="GiftReason">
+  The recipient `UserId` is invalid. A developer error — do not display as-is.
+</ResponseField>
+
+<ResponseField name="CannotGiftYourself" type="GiftReason">
+  The buyer and recipient are the same player.
+</ResponseField>
+
+<ResponseField name="GiftCooldown" type="GiftReason">
+  The buyer is within the cooldown window. Safe to silently swallow for double-clicks.
+</ResponseField>
+
+<ResponseField name="TooManyPending" type="GiftReason">
+  The buyer has too many unresolved gift intents. Governed by `GiftMaxPending`.
+</ResponseField>
+
+<ResponseField name="RecipientAlreadyOwns" type="GiftReason">
+  The recipient already holds the perk this product grants. Show a "they already have that" message.
+</ResponseField>
+
+<ResponseField name="AlreadyPending" type="GiftReason">
+  A gift of this product is already unresolved for this buyer, or a purchase/gift dialog is still open. Neither time nor a rejoin resets it — wait for the previous gift to settle.
+</ResponseField>
+
+<ResponseField name="DeliveryFailed" type="GiftReason">
+  The gift provably did not go out. The spent credit has been returned. **Retrying is safe.**
+</ResponseField>
+
+<ResponseField name="DeliveryUnconfirmed" type="GiftReason">
+  The delivery write may have committed but its answer was lost. The credit stays spent. **Do not retry** — a retry would issue a fresh credit that the recipient's deduplication cannot catch, granting twice off one payment.
+</ResponseField>
+
+<ResponseField name="PaidRandomRestricted" type="GiftReason">
+  The buyer's account policy restricts paid random items and this product is flagged `PaidRandom = true`.
+</ResponseField>
+
+<ResponseField name="PolicyPending" type="GiftReason">
+  The buyer's or recipient's paid-random policy is not yet known. Only relevant for products with `PaidRandom = true`.
+</ResponseField>
+
+<Warning>
+`DeliveryFailed` and `DeliveryUnconfirmed` are opposites and must not be shown with the same "try again" toast. Retrying after `DeliveryUnconfirmed` can double-grant. Scribe logs `GIFT_CREDIT_UNCONFIRMED` with the buyer, product, and recipient for manual reconciliation.
+</Warning>
+
+## Configuration options
+
+These live under your bundle's top-level configuration:
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `GiftCooldown` | 5 seconds | Minimum gap between one sender's prompts. |
+| `GiftMaxPending` | 20 | Unresolved gift intents one sender may hold at once. |
+| `GiftIntentTTL` | 3600 seconds | After this age, an intent is moved to the aim store (it is not cancelled). |
+| `AllowDuplicateGifts` | `false` | Whether a perk the recipient already owns may be gifted anyway. |
+| `NoGiftIntentPolicy` | `"GrantOrCredit"` | What happens when a perk product is bought with no gift intent. `"GrantOrCredit"` issues a credit; `"Hold"` keeps the receipt pending. |
+
+## One unresolved gift per product
+
+Until a paid gift settles or its current prompt is confirmed cancelled, Scribe refuses another paid gift of the **same product** by the same buyer, and blocks `PromptPurchase` for that product too. This prevents a later recipient from replacing the first:
+
+```lua
+-- Returns (false, "a gift of this item is already pending; try again shortly")
+-- if GemPack100 already has an unresolved intent
+local ok, reason = Data.PromptGift(buyer, "GemPack100", anotherRecipientId)
+```
+
+A matching cancellation clears only that prompt's gift record. If the buyer leaves before cancellation is recorded, or the server crashes before saving it, the saved intent may remain blocked. Check the gift and receipt records before any manual operator repair.
+
+## External purchases and pending gifts
+
+A purchase made outside the experience (from Roblox.com or another platform) does not take the recipient from a different gift. Scribe uses the receipt's `ProductPurchaseChannel`: only `InExperience` receipts can claim a pending gift intent. A destination already saved for the exact `PurchaseId` always takes precedence.
+
+Keep products that require a gift-recipient selection off external listings.
+
+## Where to next
+
+<CardGroup cols={2}>
+  <Card title="Monetization" href="/guides/monetization">
+    Products, passes, perks, and soft-currency purchases.
+  </Card>
+  <Card title="Transactions" href="/guides/transactions">
+    Atomic multi-field operations and the durable outbox pattern.
+  </Card>
+  <Card title="Exchange" href="/guides/exchange">
+    Atomic two-sided item trades on the same server.
+  </Card>
+  <Card title="API: Server" href="/api/server">
+    Full reference for PromptGift, GetGiftCredits, and related signals.
+  </Card>
+</CardGroup>

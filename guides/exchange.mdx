@@ -1,0 +1,261 @@
+---
+title: "Atomic Player-to-Player Item Exchanges"
+sidebarTitle: "Exchange"
+description: "Trade items and currency between two players on the same server atomically — Scribe holds both offers in escrow and applies one shared verdict so neither side can lose value."
+---
+
+The Exchange system handles trades where both players must give and receive together: Alice's Emberblade and 250 coins for Bob's Frostbrand. Scribe temporarily moves offered items into escrow, records a single shared verdict (commit or abort), and delivers each basket to its new owner — even if the server is interrupted mid-trade. Both players must be loaded on the same server.
+
+<Warning>
+Exchange requires both players to be online and loaded on the **same server**. For one-sided gifts or rewards that cross servers, use the [durable outbox pattern](/guides/transactions#cross-player-value-the-durable-outbox-pattern) instead.
+</Warning>
+
+## Declaring exchangeable paths
+
+Nothing is tradeable by default. Add an `Exchangeable` table to your bundle configuration listing every container or balance field you want to allow:
+
+```lua
+return Scribe({
+    Template = template,
+    ProfileStoreIndex = "EmberfallData",
+    ProfileKeyPrefix  = "PLAYER_",
+
+    Exchangeable = {
+        -- Move a whole inventory entry between players
+        Item  = { Path = { "Inventory" }, Kind = "Key" },
+        -- Move an amount of coins
+        Money = { Path = { "Coins" },     Kind = "Qty" },
+        -- Move part of a stacked inventory entry
+        Stack = {
+            Path     = { "Inventory" },
+            Kind     = "Stack",
+            Count    = "Qty",
+            Identity = { "Rarity" },  -- both halves keep Rarity; it must match on merge
+            Ignore   = { "Locked" },  -- Locked belongs to the owner; reset on transfer
+        },
+    },
+})
+```
+
+Scribe validates these declarations at startup. An unsafe declaration — a typo in a path, a `Qty` field with no `Min`, a `Scribe.Big` quantity — is a boot error.
+
+## Leg kinds
+
+Each basket entry is called a **leg**. Choose the `Kind` by what you want to move:
+
+| Kind | What it moves | Declared on |
+| --- | --- | --- |
+| `Key` | One whole container entry | `DictOf`, `MapOf`, `SetOf`, or `ArrayOf` |
+| `Qty` | An amount of a balance | A bounded `Scribe.Int` field |
+| `Stack` | Part of one stacked entry | `DictOf` or `MapOf` |
+
+Name the container itself, not a path that reaches through it to a child field.
+
+## Attempting a trade
+
+Build both baskets on the server after verifying both players' consent and your game's trade rules. Each basket lists what **that player gives**:
+
+```lua
+local Data = require(ReplicatedStorage.Shared.EmberfallData).Server
+
+local outcome, why = Data.Exchange.Attempt(alice, {
+    { Path = { "Inventory" }, Kind = "Key", Key = "Emberblade" },
+    { Path = { "Coins" },     Kind = "Qty", Amount = 250 },
+}, bob, {
+    { Path = { "Inventory" }, Kind = "Key", Key = "Frostbrand" },
+})
+
+if outcome == "Committed" then
+    print("Trade complete")
+elseif outcome == "Aborted" then
+    print("Trade cancelled — items returned")
+else
+    warn(`Trade unresolved or refused: {why}`)
+    -- Do NOT refund manually. Use Exchange.Open to check pending state.
+end
+```
+
+### Outcome reference
+
+| Outcome | Meaning | What to do |
+| --- | --- | --- |
+| `"Committed"` | The decision is to swap baskets. | Show success; check `Exchange.Open` for any delivery still pending. |
+| `"Aborted"` | The decision is to return baskets to their owners. | Show the cancel; Scribe handles returns including any that need to wait. |
+| `nil` + refusal reason | Refused before value moved. | Show the reason (undeclared path, player already in a trade, etc.). |
+| `nil` + unresolved reason | Scribe could not establish a verdict. | Show a pending state; do **not** refund or start a replacement. |
+
+<Warning>
+A decision (`"Committed"` or `"Aborted"`) and a completed delivery are separate. A full inventory or a conflicting key can leave a delivery waiting even after the verdict is recorded. Always show open exchanges to the player.
+</Warning>
+
+## Viewing open exchanges
+
+`Data.Exchange.Open(player)` returns every pending exchange and the value it holds. Use this server-side result to build your pending-trade UI:
+
+```lua
+for _, open in Data.Exchange.Open(alice) do
+    print(open.Id, open.State)
+    -- open.State: "Claimed" | "Staked" | "Delivering"
+
+    for _, leg in open.Staked do
+        print("gave:", leg.Kind, leg.Key or leg.Amount)
+    end
+    for _, leg in open.Owed do
+        print("owed:", leg.Kind, leg.Key or leg.Amount)
+    end
+end
+```
+
+<Info>
+Items held in escrow have left the player's inventory. Without a pending-trade UI, players see a hole where their items were. The `Exchange.Open` call is how you show them what's happening and what they're owed.
+</Info>
+
+## Escrow: how value is held
+
+When `Attempt` runs, offered items leave each player's inventory and are held in escrow under a shared exchange record. The players can continue playing — other fields remain writable — but the escrowed value cannot be spent. Resolution retries automatically on each profile load and on periodic sweeps. There is no maximum time by which a trade must finish.
+
+### ExchangeLeg fields
+
+<ParamField body="Path" type="{ string }" required>
+  Array of path segments pointing to the container or balance field (e.g. `{ "Inventory" }` or `{ "Coins" }`).
+</ParamField>
+
+<ParamField body="Kind" type='"Key" | "Qty" | "Stack"' required>
+  The transfer kind. Must match a declared `Exchangeable` entry for the same path.
+</ParamField>
+
+<ParamField body="Key" type="string">
+  For `Key` and `Stack` legs: the container key to move (e.g. `"Emberblade"`).
+</ParamField>
+
+<ParamField body="Amount" type="number">
+  For `Qty` and `Stack` legs: how much to move. For `Stack`, both the moved count and the remainder must satisfy the count field's `Min`.
+</ParamField>
+
+## Trading part of a stack
+
+Use `Kind = "Stack"` to move two Emberblades from an entry holding five. The giver keeps three; the receiver gets two added to their existing count (or a new entry if they had none):
+
+```lua
+-- Alice gives 2 of her 5 Emberblades
+{ Path = { "Inventory" }, Kind = "Stack", Key = "Emberblade", Amount = 2 }
+```
+
+### Stack split rules
+
+Both the moved count and any remainder must meet the count field's `Min`. With `Min = 1`:
+
+| Move | Leaves | Result |
+| --- | --- | --- |
+| 0 | 5 | Refused: moved count below Min |
+| 5 | 0 | Allowed: whole stack moves (entry removed) |
+| 3 | 2 | Allowed when both ≥ Min |
+
+### Classifying stack fields
+
+Every field in a record stack element must be classified in the `Exchangeable` declaration:
+
+<ParamField body="Count" type="string" required>
+  The field that holds the stack quantity (e.g. `"Qty"`). Must be a bounded `Scribe.Int`.
+</ParamField>
+
+<ParamField body="Identity" type="{ string }">
+  Fields that describe the item and must match when two stacks merge (e.g. `"Rarity"`). Both halves of a split keep the identity value.
+</ParamField>
+
+<ParamField body="Ignore" type="{ string }">
+  Fields that belong to the owner and should not travel with the item (e.g. `"Locked"`). Ignored fields are reset to their declared defaults at the destination. **Ignored fields are not returned on abort** — never put fields that represent value in `Ignore`.
+</ParamField>
+
+Scribe refuses to start if any field in the element shape is unclassified — adding a new field to a container element later without updating the declaration is a boot error.
+
+## Allowlist limitations
+
+`Exchangeable` declares which paths and kinds are structurally allowed. It does not enforce game rules like soulbound items, trade holds, or level gates. Your server code must check those:
+
+```lua
+local function legFor(player, itemId)
+    local item = Data[player].Inventory[itemId].Get()
+    if item == nil then
+        return nil, "you don't have that item"
+    end
+    if item.Locked then
+        return nil, "that item is locked"
+    end
+    return { Path = { "Inventory" }, Kind = "Key", Key = itemId }
+end
+```
+
+Always read ownership from the **giver's own data tree**. A game catalogue proves the item exists in the game — not that this player owns it.
+
+<Warning>
+Never pass client-supplied basket data directly into `Exchange.Attempt`. Build and validate baskets on the server. Scribe's allowlist rejects undeclared paths but cannot enforce your item rules or verify that both players accepted the offer.
+</Warning>
+
+## Operator recovery tools
+
+These are for investigating stalled exchanges — trades that cannot resolve automatically due to storage failures, conflicting records, or bugs. All three return `(boolean, string?)`.
+
+### Exchange.Discard
+
+Drops an abandoned **claim** that never took value. Refuses if the claim has a verdict or any staked value:
+
+```lua
+local ok, reason = Data.Exchange.Discard(exchangeId)
+```
+
+Use this for a claim left behind by a server that died between claiming a trade slot and staking into it.
+
+### Exchange.Settle
+
+Forces `"Commit"` or `"Abort"` on an exchange that cannot resolve itself:
+
+```lua
+local ok, reason = Data.Exchange.Settle(exchangeId, "Abort")
+-- or: Data.Exchange.Settle(exchangeId, "Commit")
+```
+
+<Warning>
+`Exchange.Settle` has **no default verdict**. Calling it without `"Commit"` or `"Abort"` is refused. Investigate the exchange before choosing — do not guess. `"Commit"` is additionally refused when it cannot be proved safe: when either loaded record holds escrow without a recorded incoming basket, or when only one side is loaded. `"Abort"` needs neither check. An existing verdict always wins over a `Settle` call.
+</Warning>
+
+### Exchange.Redirect
+
+Moves a **parked** delivery to a different key in the same container when the original destination key is blocked:
+
+```lua
+local ok, reason = Data.Exchange.Redirect(exchangeId, userId, "EmberbladeB")
+```
+
+Refuses a different container, a set (where the key is the value itself), and an inbox entry holding more than one key or stack leg.
+
+## What you get (and don't get)
+
+Scribe's Exchange gives you:
+
+- **One shared verdict.** A single stored decision drives the trade. Both players and every retry use it — no split-brain outcomes.
+- **Value stays recorded.** Interrupted or blocked deliveries wait in escrow or an inbox instead of being dropped or duplicated.
+- **Players keep playing.** Offered value has left the inventory (so it cannot be spent), but other fields remain writable.
+
+What it does not give you:
+
+- **A maximum resolution time.** There is no deadline by which every delivery must finish.
+- **Cross-server trades.** Both players must be on the same server.
+- **Automatic rollback of intermediate visibility.** Clients can see value held in escrow, and leaderboard writes are not rolled back with a profile.
+
+## Where to next
+
+<CardGroup cols={2}>
+  <Card title="Transactions" href="/guides/transactions">
+    One-sided transfers, the durable outbox, and Flush for save confirmation.
+  </Card>
+  <Card title="Containers" href="/guides/containers">
+    Listener rules, Update callbacks, and DictOf element shapes.
+  </Card>
+  <Card title="Gifting" href="/guides/gifting">
+    Scribe's built-in Robux gifting flow for offline recipients.
+  </Card>
+  <Card title="Diagnostics" href="/guides/diagnostics">
+    EXCHANGE_ log codes and how to read exchange health metrics.
+  </Card>
+</CardGroup>

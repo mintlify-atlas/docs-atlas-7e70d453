@@ -1,0 +1,290 @@
+---
+title: "Building Ranked Leaderboards with Scribe"
+sidebarTitle: "Leaderboards"
+description: "Rank players by any numeric stat globally, per-server, or across daily and weekly periods — with built-in refresh pacing, replication, and Scribe.Big support."
+---
+
+Scribe's leaderboard system ranks a numeric field in your template against an OrderedDataStore, refreshing in the background and serving results from a local cache so your game never blocks on a live DataStore read. Boards can be all-time or periodic, global or server-scoped, and replicated directly to clients without extra remotes.
+
+## Your first board
+
+Add a `Leaderboards` table to your shared module. Each entry names a `Stat` — a dotted path into your template — along with options for caching, display, and refresh cadence.
+
+```lua
+return Scribe({
+    Template = template,
+    ProfileStoreIndex = "EmberfallData",
+    ProfileKeyPrefix = "PLAYER_",
+
+    Leaderboards = {
+        TopLevel = {
+            Stat       = "Level",
+            Limit      = 100,
+            Replicate  = true, -- stream to every client on this server
+        },
+        TopCoins = {
+            Stat            = "Coins",
+            Limit           = 50,
+            WriteInterval   = 60,   -- write a player's changed score at most once per minute
+            RefreshInterval = 300,  -- re-read the top scores every 5 minutes
+        },
+    },
+})
+```
+
+Scribe watches the declared stat on every loaded player and queues a write when it changes. A background loop reads the top entries on each board's own `RefreshInterval`. The first refresh lands a few seconds after the server boots; boards are staggered so they don't all read at once.
+
+<Note>
+Each entry in `Data.GetLeaderboard` has shape `{ Rank, UserId, Name, Score }`. `Rank` is 1-indexed with the highest score first. `Score` returns in the field's own units, or as a `BigScore` table for `Scribe.Big` stats.
+</Note>
+
+## Reading a board on the server
+
+```lua
+local Data = require(ReplicatedStorage.Shared.EmberfallData).Server
+
+-- Top 10 entries, newest cache
+for _, entry in Data.GetLeaderboard("TopLevel", 10) do
+    print(entry.Rank, entry.Name, entry.Score)
+end
+
+-- A player's current rank within the top Limit (nil if unranked)
+local myRank = Data.GetMyRank(player, "TopLevel")
+```
+
+`GetLeaderboard` and `GetMyRank` never trigger a live DataStore request — they read the local cache only. React to updates with `OnLeaderboard` instead of polling:
+
+```lua
+Data.OnLeaderboard:Connect(function(boardName, entries)
+    if boardName ~= "TopLevel" then return end
+    redrawBoard(entries) -- entries is a fresh copy; safe to mutate
+end)
+```
+
+## Reading a replicated board on the client
+
+Set `Replicate = true` on any board you want streamed to clients. The client API mirrors the server's, minus the player argument on `GetMyRank`:
+
+```lua
+local Data = require(ReplicatedStorage.Shared.EmberfallData).Client
+
+for _, entry in Data.GetLeaderboard("TopLevel", 10) do
+    row(entry.Rank).Text = `{entry.Name} — level {entry.Score}`
+end
+
+local myRank = Data.GetMyRank("TopLevel") -- no player arg on the client
+```
+
+<Warning>
+The client's `OnLeaderboard` fires the **same table it caches internally** — not a copy. If your listener sorts, trims, or annotates the `entries` array in place, it corrupts what `GetLeaderboard` returns until the next refresh. Copy the array first, or read through `GetLeaderboard` which clones on the way out.
+</Warning>
+
+## Full LeaderboardConfig reference
+
+<ParamField body="Stat" type="string" required>
+  Dotted path to a numeric, `Scribe.Int`, or `Scribe.Big` field in your template (e.g. `"Level"`, `"Stats.Playtime"`). Checked at startup — a wrong path or a non-numeric field is a boot error.
+</ParamField>
+
+<ParamField body="Limit" type="number">
+  Maximum entries to store and serve. Defaults to 100. `GetMyRank` returns `nil` for players outside the top `Limit`.
+</ParamField>
+
+<ParamField body="Scale" type="number">
+  Multiplier applied before writing to the OrderedDataStore (which stores only integers). Use `Scale = 100` to rank to two decimal places. Defaults to 1. Not supported on `Scribe.Big` stats.
+</ParamField>
+
+<ParamField body="SigFigs" type="number">
+  For `Scribe.Big` stats only: significant figures for the ranking key (1–15, default 12). More figures = better resolution but smaller maximum rankable value.
+</ParamField>
+
+<ParamField body="Replicate" type="boolean">
+  Stream the board to every client. Defaults to `false`. Not supported on `Scribe.Big` stats.
+</ParamField>
+
+<ParamField body="WriteInterval" type="number">
+  Minimum seconds between score writes for one player. Defaults to 30. Must be a positive finite number; values below 1 second are clamped up.
+</ParamField>
+
+<ParamField body="RefreshInterval" type="number">
+  How often the board re-reads from the OrderedDataStore, in seconds. Defaults to 60. Values below 60 are clamped up with a `LB_INTERVAL_CLAMPED` log.
+</ParamField>
+
+<ParamField body="StoreName" type="string">
+  Override the DataStore name (default: `LB_<boardName>`). Use this to share a board across places or separate test and production data.
+</ParamField>
+
+<ParamField body="Period" type='"Daily" | "Weekly"'>
+  Make this a periodic board that resets. `nil` for a lifetime board.
+</ParamField>
+
+<ParamField body="Mode" type='"Gain" | "Peak"'>
+  Only relevant with `Period`. `Gain` (default) ranks cumulative progress since the period began. `Peak` ranks the highest value seen during the period.
+</ParamField>
+
+<ParamField body="Scope" type='"Global" | "Server"'>
+  `"Global"` (default) uses an OrderedDataStore. `"Server"` ranks only the players currently on this server — no DataStore reads, no cost, refreshes every 5 seconds by default.
+</ParamField>
+
+## Daily and weekly boards
+
+Declare `Period` to make a board reset on a schedule. Scribe tracks a baseline per player per period and writes only the difference (Gain mode) or the session peak (Peak mode):
+
+```lua
+Leaderboards = {
+    WinsAllTime = { Stat = "Wins", Replicate = true },
+    WinsDaily   = { Stat = "Wins", Period = "Daily",  Replicate = true },
+    WinsWeekly  = { Stat = "Wins", Period = "Weekly" },
+    BestCombo   = { Stat = "Combo", Period = "Daily", Mode = "Peak" },
+},
+```
+
+The reset clock is configured once at the bundle level:
+
+```lua
+PeriodReset = { UtcOffset = -8, WeekStart = "Monday" },
+```
+
+`UtcOffset` is a fixed offset from UTC in hours (fractional values are allowed for half-hour zones). `WeekStart` defaults to Monday. Changing the offset shifts every period index — plan the change between periods to avoid partial-period artifacts.
+
+### Timing helpers
+
+```lua
+-- Seconds until the board's next DataStore read
+local refreshIn = Data.GetLeaderboardRefreshIn("WinsDaily")
+
+-- Seconds until the current period ends (nil for non-periodic boards)
+local resetIn = Data.GetLeaderboardResetIn("WinsDaily")
+```
+
+### Reading the previous period
+
+Pass `offset = -1` to `GetLeaderboard` on the server to read last period's winners:
+
+```lua
+local previousWinners = Data.GetLeaderboard("WinsDaily", 10, -1)
+```
+
+Scribe reads the previous period at the first two refreshes after rollover and caches the result for the rest of the current period.
+
+## Server-scoped boards
+
+`Scope = "Server"` ranks the players currently on this server with no DataStore writes:
+
+```lua
+Leaderboards = {
+    RoundLeaders = {
+        Stat           = "Wins",
+        Scope          = "Server",
+        Replicate      = true,
+        RefreshInterval = 2, -- sort in memory every 2 seconds
+    },
+},
+```
+
+Server boards compose with `Period`, respect `Replicate`, support `GetMyRank`, and are exempt from the global read-budget guard. A player who leaves drops off at the next refresh.
+
+## Board status and health
+
+```lua
+local status = Data.GetLeaderboardStatus("TopCoins")
+-- status.Status: "Starting" | "Healthy" | "Degraded"
+-- status.PendingWrites, status.RetryingWrites, status.RejectedWrites
+-- status.ReadAge, status.LastReadError, status.LastWriteError
+```
+
+`"Starting"` means no successful refresh yet. `"Degraded"` means the cache is stale (older than twice the refresh interval) or recent operations failed. This is independent of `Scribe.GetStatus()`, which covers profile persistence health.
+
+## Ranking a Scribe.Big stat
+
+`Scribe.Big` values — those whose totals exceed `2^53` — rank natively without lossy conversion. Declare the board the same way; `Score` entries are returned as `BigScore` tables:
+
+```lua
+Leaderboards = {
+    TopEssence = { Stat = "Essence", SigFigs = 12 },
+},
+```
+
+```lua
+for _, entry in Data.GetLeaderboard("TopEssence", 10) do
+    local score = entry.Score
+    if type(score) == "table" then
+        print(entry.Name, score:Short())   -- e.g. "1.23e45"
+    end
+end
+```
+
+<Warning>
+`Scribe.Big` boards cannot use `Replicate = true`. Big scores are packed as integers in the store and cannot safely cross the replication wire. Read them on the server and forward what your UI needs via a Command.
+</Warning>
+
+### SigFigs range reference
+
+| `SigFigs` | Largest rankable value | Best for |
+| --- | --- | --- |
+| 6 | `1e9007199253` | A counter where magnitude is everything |
+| 9 | `1e9007198` | Medium range with moderate precision |
+| **12** (default) | **`1e9006`** | Almost all use cases |
+| 14 | `1e89` | Separating near-identical prestige scores |
+
+A score above the board's cap is dropped and logged as `LB_SCORE_OUT_OF_RANGE`.
+
+## Complete example
+
+```lua
+return Scribe({
+    Template = template,
+    ProfileStoreIndex = "EmberfallData",
+    ProfileKeyPrefix  = "PLAYER_",
+
+    PeriodReset = { UtcOffset = 0, WeekStart = "Monday" },
+
+    Leaderboards = {
+        -- All-time global board, replicated to clients
+        TopLevel = {
+            Stat      = "Level",
+            Limit     = 100,
+            Replicate = true,
+        },
+
+        -- Daily win gain, replicated for a UI countdown
+        WinsToday = {
+            Stat      = "Wins",
+            Period    = "Daily",
+            Mode      = "Gain",
+            Replicate = true,
+        },
+
+        -- Server-only round scoreboard, fast refresh
+        RoundScore = {
+            Stat            = "RoundPoints",
+            Scope           = "Server",
+            Replicate       = true,
+            RefreshInterval = 3,
+        },
+
+        -- Big number prestige board, server-only read
+        TopEssence = {
+            Stat    = "Essence",
+            Limit   = 50,
+            SigFigs = 12,
+        },
+    },
+})
+```
+
+## Where to next
+
+<CardGroup cols={2}>
+  <Card title="Replication" href="/guides/replication">
+    Control which fields each player can see and how they're streamed.
+  </Card>
+  <Card title="Diagnostics" href="/guides/diagnostics">
+    Queue depths, budget deferral counters, and board health metrics.
+  </Card>
+  <Card title="Transactions" href="/guides/transactions">
+    Atomic multi-field operations when value needs to move safely.
+  </Card>
+  <Card title="API: Server" href="/api/server">
+    Full reference for GetLeaderboard, GetMyRank, and related calls.
+  </Card>
+</CardGroup>

@@ -1,0 +1,159 @@
+---
+title: "Get Started with Scribe in Minutes"
+sidebarTitle: "Quickstart"
+description: "A five-step walkthrough that takes you from a fresh project to a working server-to-client data flow using Scribe's Mock mode."
+---
+
+This guide walks you through creating a complete Scribe setup in a new Roblox place. By the end, the server will give a player 50 coins and the client will print the updated balance. The whole tutorial uses **Mock mode**, which keeps data in memory and never touches DataStore, so it is safe to experiment freely and the setup is identical whether you are testing in Studio or deploying to production.
+
+<Steps>
+
+### Install Scribe
+
+The fastest way to install Scribe is with [Wally](https://wally.run). Add one line to your `wally.toml` and run `wally install`. Scribe bundles the ProfileStore version it needs — there is no second dependency.
+
+```toml
+# wally.toml
+[dependencies]
+Scribe = "ericplane/scribe@2.5.0"
+```
+
+```
+wally install
+```
+
+Then use your Rojo project to place the resulting `Packages` folder in `ReplicatedStorage`. For Studio-only projects, see the [Installation guide](/guides/installation) for the rbxm download path.
+
+### Create the shared GameData module
+
+Create this folder structure in Studio. The names matter because the scripts below use these exact paths.
+
+```
+ReplicatedStorage
+├── Packages
+│   └── Scribe          ← installed package
+└── Shared
+    └── GameData        ← ModuleScript (create this)
+ServerScriptService
+└── PlayerData          ← Script (create this)
+StarterPlayer
+└── StarterPlayerScripts
+    └── PlayerData      ← LocalScript (create this)
+```
+
+Paste the following into **ReplicatedStorage.Shared.GameData**:
+
+```lua
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Scribe = require(ReplicatedStorage.Packages.Scribe)
+
+return Scribe({
+    Template = {
+        Coins = 0,
+        Settings = {
+            Music = true,
+        },
+    },
+    ProfileStoreIndex = "ScribeTutorial",
+    ProfileKeyPrefix = "PLAYER_",
+    Mode = "Mock",
+})
+```
+
+The **template** describes a new player's starting data: zero coins and music enabled. `ProfileStoreIndex` names the DataStore; `ProfileKeyPrefix` is the prefix used for each player's key inside it. Keep both stable once you start saving real data.
+
+This module returns two APIs: `.Server` for server scripts and `.Client` for LocalScripts. Both sides require the same module.
+
+<Note>
+  `Mode = "Mock"` starts fresh on every server run and never writes to DataStore. It is the recommended way to develop and test. See the [Installation guide](/guides/installation) for how to switch to live saving.
+</Note>
+
+### Give the player coins on the server
+
+Paste the following into **ServerScriptService.PlayerData**:
+
+```lua
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Data = require(ReplicatedStorage.Shared.GameData).Server
+
+local function onPlayerAdded(player: Player)
+    local data, reason = Data.WaitForData(player)
+    if not data then
+        warn("Could not load player data:", reason)
+        return
+    end
+
+    data.Coins.Increment(50)
+    print("Server coins:", data.Coins.Get())
+    print("Music enabled:", data.Settings.Music.Get())
+end
+
+Players.PlayerAdded:Connect(onPlayerAdded)
+for _, player in Players:GetPlayers() do
+    task.spawn(onPlayerAdded, player)
+end
+```
+
+`WaitForData(player)` yields until the player's profile is ready (up to 60 seconds by default) and returns the typed accessor tree. The second return value is a reason string if loading failed — always handle the `nil` case, because a player can leave before their data finishes loading.
+
+Once you have `data`, `Get()` reads a field and `Increment(50)` adds 50 to it. The final loop handles players who joined before this script started, which can happen in Studio.
+
+### Read changes on the client
+
+Paste the following into **StarterPlayerScripts.PlayerData**:
+
+```lua
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Data = require(ReplicatedStorage.Shared.GameData).Client
+
+Data.Coins.Observe(function(coins)
+    print("Client coins:", coins)
+end)
+```
+
+`Observe` calls your function immediately with the current value, then again whenever the value changes. Before the server's first update arrives the value is the template default (`0`), so you may see a `0` print first.
+
+<Warning>
+  The client must require `GameData` for replication to start. Requiring the module only on the server is not enough — the LocalScript is what initialises the client-side transport listener.
+</Warning>
+
+### Play and verify
+
+Press **Play** in Studio and open the **Output** window. You should see output from both sides:
+
+```
+Server coins: 50
+Music enabled: true
+Client coins: 0
+Client coins: 50
+```
+
+The client may print `0` first as the template default, and the message order can vary between runs. Seeing `50` on both sides confirms that the server write reached the client through Scribe's replication layer.
+
+Stop and play again. The balance resets to zero because `Mode = "Mock"` uses an in-memory store. That is intentional for development.
+
+</Steps>
+
+## What to Try Next
+
+You now have a working Scribe setup. Here are the natural next steps:
+
+<CardGroup cols={2}>
+  <Card title="Templates" icon="table" href="/guides/templates">
+    Add declarators like `Scribe.Int`, `Scribe.Flags`, and `Scribe.DictOf` to your template for bounds, containers, and computed fields.
+  </Card>
+  <Card title="Values" icon="pen" href="/guides/values">
+    Learn the full set of accessor methods: `Get`, `Set`, `Increment`, `Observe`, `Changed`, and container operations.
+  </Card>
+  <Card title="Lifecycle" icon="rotate" href="/guides/lifecycle">
+    Understand `OnPlayerInit`, save hooks, session states, and how to handle players leaving before data loads.
+  </Card>
+  <Card title="Replication" icon="arrows-rotate" href="/guides/replication">
+    Control which fields replicate to which clients using `Scribe.ServerOnly`, `Scribe.Shared`, and `Scribe.Session`.
+  </Card>
+</CardGroup>
+
+<Tip>
+  **Enable typed autocomplete.** In Studio, select **Workspace** in the Explorer panel and set `UseNewLuauTypeSolver` to `Enabled`. Scribe's type functions will then generate a full typed accessor tree for your template, so `data.Coins.Increment` is checked at compile time instead of resolving to `any`.
+</Tip>

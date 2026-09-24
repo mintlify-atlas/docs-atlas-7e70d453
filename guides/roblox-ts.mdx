@@ -1,0 +1,408 @@
+---
+title: "Using Scribe with roblox-ts TypeScript"
+sidebarTitle: "roblox-ts"
+description: "Install Scribe's npm packages, write typed templates and accessor trees in TypeScript, and use all add-ons with full type inference — same runtime, zero forks."
+---
+
+Scribe's npm packages run the **exact same Luau implementation** as the Wally package and the Studio model. TypeScript declarations sit on top of that runtime — they describe the schema, accessor trees, server and client APIs, and add-on interfaces. There is no TypeScript runtime fork, no separate schema format, and no compiler transformer required. Everything you read in the Luau guides applies here.
+
+## Installation
+
+Install the core package in an existing roblox-ts project:
+
+```sh
+npm install @rbxts/scribe
+```
+
+Use **roblox-ts 3** with TypeScript 5.5 and the matching `@rbxts/compiler-types`. Keep the normal roblox-ts `strict`, `noLib`, and `typeRoots` settings. Your usual Rojo mapping for `node_modules/@rbxts` includes Scribe automatically.
+
+<Note>
+  The npm packages are prepared for initial publication. Repository owners must complete the release setup in `CONTRIBUTING.md` before these registry installs are available. Check the [repository](https://github.com/ericplane/Scribe) for current publication status.
+</Note>
+
+## A Shared Template
+
+Define your template and bundle in a shared module so both server and client scripts import from the same source:
+
+```ts
+// shared/data.ts
+import Scribe from "@rbxts/scribe";
+
+export const template = {
+    Coins:      Scribe.Int(0, { Min: 0 }),
+    Essence:    Scribe.Big(0),
+    Settings:   { Music: true },
+    Inventory:  Scribe.DictOf({
+        Count:  Scribe.Int(1, { Min: 1 }),
+        Rarity: Scribe.Enum("Common", ["Common", "Rare", "Legendary"]),
+    }),
+    RecentRuns: Scribe.ArrayOf({ Score: 0 }, { MaxItems: 10, Evict: "Front" }),
+    Secret:     Scribe.ServerOnly(0),
+};
+
+export const Data = Scribe({
+    Template:          template,
+    ProfileStoreIndex: "PlayerData",
+    ProfileKeyPrefix:  "PLAYER_",
+    Mode:              "Mock",  // fresh data, no saves — see Testing guide before going live
+});
+```
+
+Primitive defaults widen to their value type: `Coins` holds numbers and `Settings.Music` holds booleans. Enum members retain their declared names. Containers infer both their entry shape and the permitted operations.
+
+## Server and Client Usage
+
+<Tabs>
+  <Tab title="Server">
+    ```ts
+    // server/data.server.ts
+    import { Data } from "shared/data";
+
+    game.GetService("Players").PlayerAdded.Connect((player) => {
+        const [data, reason] = Data.Server.WaitForData(player);
+        if (data === undefined) {
+            warn(reason);
+            return;
+        }
+
+        data.Coins.Increment(50);
+        data.Settings.Music.Toggle();
+        data.Inventory.Child("Sword").Set({ Count: 1, Rarity: "Rare" });
+    });
+    ```
+
+    `WaitForData` returns a `LuaTuple` — use array destructuring to receive both results. `Data.Server.Get(player)` is the non-yielding lookup. The Luau shortcut `Data[player]` is not a TypeScript object index.
+  </Tab>
+  <Tab title="Client">
+    ```ts
+    // client/data.client.ts
+    import { Data } from "shared/data";
+
+    const disconnect = Data.Client.Coins.Observe((coins) => {
+        print(`Coins: ${coins}`);
+    });
+
+    // Call disconnect() when the consumer is destroyed.
+    ```
+
+    Accessor methods are closure properties — write `data.Coins.Increment(50)` as shown. roblox-ts emits the appropriate dot call. Ordinary object methods such as `Data.Server.OnSave.Connect(...)` compile to colon calls automatically.
+  </Tab>
+</Tabs>
+
+## Containers and Indices
+
+Use `Child(key)` to address a container entry. It also works for record fields whose names overlap with accessor methods (`Get`, `Set`, `Count`, `Child`).
+
+```ts
+data.RecentRuns.Insert({ Score: 4200 });
+const score = data.RecentRuns.Child(1).Score.Get();
+data.RecentRuns.Remove(1);
+
+const sword = data.Inventory.Child("Sword").Get();
+if (sword !== undefined) {
+    print(sword.Count);
+}
+```
+
+<Warning>
+  **Accessor positions are one-based.** `Child(1)`, `Remove(1)`, an explicit `Insert` position, and indices reported by collection events refer to the first Luau array slot.
+
+  **Array snapshots from `.Get()` use ordinary TypeScript indexing.** If `runs` is the array returned by `data.RecentRuns.Get()`, `runs[0]` addresses the first element because roblox-ts compiles normal array indexing to Luau's first slot. Keep access through `Child` to make the distinction explicit.
+</Warning>
+
+## Type Aliases
+
+### `Scribe.ServerData<T, S>`
+
+The fully typed server API for a bundle with player template `T` and server store template `S`. Includes read-write accessors for all fields, `ServerStore`, and all server-side methods.
+
+### `Scribe.ClientData<T, S>`
+
+The client API for the same bundle. Omits `ServerOnly` fields from the accessor tree (absent from the type entirely — reading one is a compile error). Store accessors are read-only.
+
+### `Scribe.PlayerData<T>`
+
+The typed accessor tree for one player's data, as returned by `WaitForData` or `Get`. Use this to type functions that receive a player's data object:
+
+```ts
+import Scribe from "@rbxts/scribe";
+import { template } from "shared/data";
+
+type PlayerData = Scribe.PlayerData<typeof template>;
+
+function grantDailyReward(data: PlayerData) {
+    data.Coins.Increment(100);
+}
+```
+
+### `Scribe.Bundle<T, S>`
+
+The full bundle type when you need to annotate the result of `Scribe({...})` or `Scribe.new({...})` explicitly:
+
+```ts
+import Scribe from "@rbxts/scribe";
+
+const Data: Scribe.Bundle<typeof template, typeof serverStore> = Scribe.new({
+    Template:          template,
+    ServerStore:       serverStore,
+    ProfileStoreIndex: "PlayerData",
+    ProfileKeyPrefix:  "PLAYER_",
+});
+```
+
+## ServerStore in TypeScript
+
+Declare a server store template alongside your player template and pass it to `Scribe.new`:
+
+```ts
+// shared/data.ts
+import Scribe from "@rbxts/scribe";
+
+const template = {
+    Coins: Scribe.Int(0, { Min: 0 }),
+};
+
+const serverStore = {
+    Wave:         Scribe.Int(0),
+    Round:        { Running: false },
+    ServerSecret: Scribe.ServerOnly({ Seed: Scribe.Int(0) }),
+};
+
+export const Data = Scribe.new({
+    Template:          template,
+    ServerStore:       serverStore,
+    ProfileStoreIndex: "PlayerData",
+    ProfileKeyPrefix:  "PLAYER_",
+    Mode:              "Mock",
+});
+```
+
+```ts
+// Server script:
+Data.Server.ServerStore.Wave.Increment(1);
+Data.Server.ServerStore.Round.Set({ Running: true });
+
+// Client script:
+const disconnect = Data.Client.ServerStore.Wave.Observe((wave) => print(wave));
+```
+
+`ServerSecret` is absent from the client store type. Client store accessors are read-only. See the [Server Store guide](/guides/server-store) for lifetime and replication details.
+
+## Shared Command Contracts
+
+Describe command names, argument tuples, and handler returns once in your shared module to connect independently compiled client requests and server registrations:
+
+```ts
+// shared/data.ts
+import Scribe from "@rbxts/scribe";
+
+const template     = { Equipped: "" };
+const serverStore  = { Season: 1 };
+
+interface Commands {
+    Equip: (this: void, itemId: string) => LuaTuple<[boolean, string]>;
+}
+
+export const Data = Scribe<typeof template, typeof serverStore, Commands>({
+    Template:          template,
+    ServerStore:       serverStore,
+    ProfileStoreIndex: "PlayerData",
+    ProfileKeyPrefix:  "PLAYER_",
+    Mode:              "Mock",
+});
+```
+
+```ts
+// Server: register the handler.
+Data.Server.Command("Equip", { Args: ["string"] }, (player, itemId) => {
+    const data = Data.Server.Get(player);
+    if (data === undefined) return $tuple(false, "data unavailable");
+    data.Equipped.Set(itemId);
+    return $tuple(true, itemId);
+});
+
+// Client: send the request.
+const [success, message, requestFailed] = Data.Client.Request("Equip", "Sword");
+if (requestFailed === Scribe.RequestFailed) {
+    warn(message); // Scribe rejected or could not complete the request.
+} else if (success) {
+    print(message);
+}
+```
+
+The runtime `Args` specification still validates incoming packets. Validate game rules such as ownership and permissions inside the handler.
+
+## Big Numbers
+
+TypeScript does not support custom operator overloads, so Big values provide named methods:
+
+```ts
+const essence = data.Essence.Get();
+const next    = essence.Multiply(2).Add("1e399");
+if (next.Compare("1e400") >= 0) {
+    print(next.Short());
+}
+```
+
+Use `Add`, `Subtract`, `Multiply`, `Divide`, and `Negate` instead of `+`, `-`, `*`, `/`. Use `Compare` (returns `-1`, `0`, or `1`) and `Equals` instead of `<` and `===`. Stored Big accessors retain their existing methods such as `Increment` and `Decrement`.
+
+## Diagnostics in TypeScript
+
+Load phases, leaderboard health, log codes, and sink options are all typed:
+
+```ts
+import Scribe from "@rbxts/scribe";
+import { Data } from "shared/data";
+
+// Check a player's load phase.
+function reportLoad(player: Player) {
+    const [state, phase] = Data.Server.GetState(player);
+    if (state === Scribe.SessionState.Loading) {
+        print(phase); // Scribe.LoadPhase | undefined
+    }
+}
+
+// Add a typed log sink.
+const disconnect = Scribe.AddLogSink((entry) => {
+    print(entry.Code, entry.Message);
+}, { Level: Scribe.LogLevel.Warn, MaxQueued: 64 });
+
+// Inspect all leaderboard statuses.
+for (const board of Scribe.GetLeaderboardSnapshot()) {
+    if (board.Status === Scribe.LeaderboardStatus.Degraded) {
+        warn(board.Name, board.PendingWrites, board.LastWriteError);
+    }
+}
+```
+
+## Add-ons
+
+Each add-on is a separate optional npm package. The core package includes none of their runtime files, declarations, or framework dependencies.
+
+<Tabs>
+  <Tab title="UI: React">
+    ```sh
+    npm install @rbxts/scribe-react @rbxts/react
+    ```
+
+    ```ts
+    import React from "@rbxts/react";
+    import ScribeReact from "@rbxts/scribe-react";
+    import { Data } from "shared/data";
+
+    const { useScribe, useScribeBinding } = ScribeReact(React);
+
+    function CoinLabel() {
+        const coins = useScribe(Data.Client.Coins); // number
+        return React.createElement("TextLabel", { Text: `${coins} coins` });
+    }
+    ```
+
+    `useScribeBinding` returns `React.Binding<T>` for property updates without a re-render. Both helpers follow React's hook rules.
+  </Tab>
+  <Tab title="UI: Vide">
+    ```sh
+    npm install @rbxts/scribe-vide @rbxts/vide
+    ```
+
+    ```ts
+    import Vide from "@rbxts/vide";
+    import ScribeVide from "@rbxts/scribe-vide";
+    import { Data } from "shared/data";
+
+    const useScribe = ScribeVide(Vide);
+
+    // Inside a Vide scope:
+    const [coins, disconnect] = useScribe(Data.Client.Coins);
+    Vide.cleanup(disconnect);
+    print(coins());
+    ```
+  </Tab>
+  <Tab title="UI: Fusion">
+    ```sh
+    npm install @rbxts/scribe-fusion @rbxts/fusion
+    ```
+
+    ```ts
+    import Fusion from "@rbxts/fusion";
+    import ScribeFusion from "@rbxts/scribe-fusion";
+    import { Data } from "shared/data";
+
+    const useScribe = ScribeFusion(Fusion); // Fusion 0.2
+    const [coins, disconnect] = useScribe(Data.Client.Coins);
+    print(coins.get());
+    // Call disconnect() when the UI is destroyed.
+    ```
+
+    The scoped 0.3 overload accepts a typed `Value(scope, initial)` implementation plus its scope and registers cleanup automatically.
+  </Tab>
+  <Tab title="Telemetry">
+    ```sh
+    npm install @rbxts/scribe-telemetry
+    ```
+
+    ```ts
+    import Scribe from "@rbxts/scribe";
+    import ScribeTelemetry from "@rbxts/scribe-telemetry";
+
+    const telemetry = ScribeTelemetry.Start(Scribe, {
+        Webhooks: {
+            Alerts: { Url: "https://<proxy>/api/webhooks/<id>/<token>" },
+        },
+        Default: "Alerts",
+        Leaderboards: { Enabled: true, Interval: 15, MaxBoards: 20 },
+    });
+
+    const [queued, reason] = telemetry.Preview("Alerts", "LeaderboardDegraded");
+    ```
+
+    Destination names are inferred from `Webhooks` — a typo in a route or `telemetry.Test(...)` destination is a type error.
+  </Tab>
+  <Tab title="Leaderstats">
+    ```sh
+    npm install @rbxts/scribe-leaderstats
+    ```
+
+    ```ts
+    import ScribeLeaderstats from "@rbxts/scribe-leaderstats";
+    import { Data } from "shared/data";
+
+    const leaderstats = ScribeLeaderstats.Start(Data.Server, {
+        Coins: "Coins",
+        Level: "Progress.Level",
+    });
+
+    // During teardown:
+    leaderstats.Stop();
+    ```
+
+    Display paths are checked against your actual server schema at compile time — misspellings, containers, and `Big` values are rejected.
+  </Tab>
+</Tabs>
+
+## The New Luau Type Solver
+
+Scribe uses Luau's new type solver (`--!strict` with the `typecheck` flag) for its type function-based schema inference. This is what makes the TypeScript declarations derive accessors, omit `ServerOnly` fields from the client type, and propagate container shapes automatically.
+
+As a roblox-ts user this is **transparent to you** — roblox-ts compiles TypeScript to Luau, and the runtime calls the same code regardless. You do not need to configure the Luau type solver in your project; it only matters if you are working in the Scribe source itself.
+
+## Maintaining One Implementation
+
+Runtime changes belong in `src/`; TypeScript declarations belong in `types/`. There is no separate release branch. The package checks cover valid and invalid TypeScript usage, actual roblox-ts compilation, module resolution, and the emitted calling conventions. Luau tests continue to exercise the shared runtime.
+
+Each published package includes `Scribe-source-map.json` to map runtime error line numbers back to the matching release source.
+
+<CardGroup cols={2}>
+  <Card title="Add-ons" icon="puzzle-piece" href="/guides/addons">
+    Luau installation and usage for all three add-on categories.
+  </Card>
+  <Card title="Server Store" icon="server" href="/guides/server-store">
+    ServerStore lifetime, replication, and the TypeScript ServerData and ClientData types.
+  </Card>
+  <Card title="Commands" icon="terminal" href="/guides/commands">
+    Full command dispatch including typed contracts and RequestFailed.
+  </Card>
+  <Card title="API: Types" icon="file-code" href="/api/types">
+    All exported types including LogEntry, SaveInfo, LeaderboardSnapshotEntry.
+  </Card>
+</CardGroup>

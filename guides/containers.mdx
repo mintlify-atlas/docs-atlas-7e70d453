@@ -1,0 +1,279 @@
+---
+title: "Working with Container Fields in Scribe"
+sidebarTitle: "Containers"
+description: "Explore Scribe's five container declarators — ArrayOf, DictOf, MapOf, SetOf, and Flags — with practical examples for inventories, sets, and reactive listeners."
+---
+
+Most player data is a collection of something: items in a bag, regions you have unlocked, the last ten runs you played. Scribe's container fields hold many entries under one name and give every entry the same validation, bounds enforcement, and typed accessor surface a top-level scalar field gets. Reach for a container whenever the number of things is not known when you write the template.
+
+There are five container declarators. Each answers a different question about your data.
+
+| Declarator | Holds | Keyed by | Reach for it when |
+|---|---|---|---|
+| `Scribe.DictOf(shape, opts)` | Many entries of one shape | Any string | The key is an ID you already have |
+| `Scribe.MapOf(keyType, shape, opts)` | Many entries of one shape | A declared key type | The keys are numbers, such as user IDs |
+| `Scribe.ArrayOf(shape, opts)` | An ordered list | Position | Order matters, or entries have no ID |
+| `Scribe.SetOf(element, opts)` | Unique scalars | Nothing | You only care about membership |
+| `Scribe.Flags(members)` | A fixed set of booleans | A declared name | The names are known up front |
+
+## DictOf — String-Keyed Inventories
+
+`Scribe.DictOf` holds many entries of one shape, keyed by arbitrary strings. This is the natural fit for an inventory keyed by item ID.
+
+```lua
+local RARITIES = { "Common", "Rare", "Epic", "Legendary" }
+
+local template = {
+    Inventory = Scribe.DictOf({
+        Qty    = Scribe.Int(1, { Min = 1, Max = 999 }),
+        Rarity = Scribe.Enum("Common", RARITIES),
+    }, { MaxKeys = 200 }),
+}
+```
+
+Writing a key creates it; the entry is a typed accessor like any other field.
+
+```lua
+local data, reason = Data.WaitForData(player)
+if not data then return end
+
+-- write an entry
+data.Inventory.Emberblade.Set({ Qty = 1, Rarity = "Legendary" })
+
+-- read and mutate a child field
+data.Inventory.Emberblade.Qty.Increment(1)   --> 2
+print(data.Inventory.Emberblade.Rarity.Get()) --> "Legendary"
+
+-- count and remove
+print(data.Inventory.Count())                 --> 1
+data.Inventory.Remove("Emberblade")
+```
+
+`MaxKeys = 200` turns unbounded growth into a write error naming the field, rather than a profile that quietly grows until it can no longer save.
+
+<Note>
+  A key exists only once something writes it. `Get()` on an unwritten key returns `nil` and `Count()` excludes it.
+</Note>
+
+### Additional dict/map methods
+
+| Method | What it does |
+|---|---|
+| `Remove(key)` | Removes the entry at `key` |
+| `Count()` | Returns the number of entries |
+| `Clear()` | Removes all entries |
+| `OnKeyAdded(fn)` | Fires `(key, entry)` when a new key is written |
+| `OnKeyRemoved(fn)` | Fires `(key, entry)` when a key is removed |
+| `OnChildChanged(fn)` | Fires `(key, new, old)` when any direct child's value changes |
+
+## ArrayOf — Ordered Lists
+
+`Scribe.ArrayOf` holds contiguous integer-indexed entries, with new entries created by `Insert`. It is the right choice when order matters or entries have no natural ID.
+
+```lua
+RecentRuns = Scribe.ArrayOf({
+    Zone  = Scribe.String("", { MaxLength = 32 }),
+    Score = Scribe.Int(0, { Min = 0 }),
+}, { MaxItems = 10, Evict = "Front" }),
+```
+
+```lua
+-- append a run
+data.RecentRuns.Insert({ Zone = "Ashfall Ridge", Score = 4200 })
+
+-- read by index
+print(data.RecentRuns[1].Score.Get())
+
+-- remove by index; returns the removed entry
+data.RecentRuns.Remove(1)
+
+-- count
+print(data.RecentRuns.Count())
+```
+
+### MaxItems and Evict
+
+By default, `Insert` at capacity is a write error. Adding `Evict` turns the cap into a rolling window that drops an entry to make room.
+
+```lua
+-- Evict = "Front" drops the oldest entry when full
+-- use with Insert(item) to append; oldest is always at the front
+RecentRuns = Scribe.ArrayOf({ ... }, { MaxItems = 10, Evict = "Front" }),
+```
+
+`Evict` takes `"Front"` or `"Back"`, naming the **end to drop from**. Append with `Insert(item)` and the oldest sits at the front, so use `"Front"`. Prepend with `Insert(item, 1)` and the oldest sits at the back, so use `"Back"`. The drop fires `OnRemove` and replicates, so listeners see what was dropped and client mirrors stay the right length.
+
+<Tip>
+  `Evict` is an `ArrayOf`-only option. `DictOf`, `MapOf`, and `SetOf` refuse it because none of them has a positional end to drop from.
+</Tip>
+
+### Array-specific methods
+
+| Method | What it does |
+|---|---|
+| `Insert(entry, index?)` | Inserts at `index` (default: end) |
+| `Remove(index)` | Removes and returns the entry at `index` |
+| `RemoveValue(entry)` | Removes the first entry matching `entry` by value |
+| `Find(entry)` | Returns the index of the first matching entry, or `nil` |
+| `Has(entry)` | Returns whether any entry matches `entry` by value |
+| `Count()` | Returns the number of entries |
+| `Clear()` | Removes all entries |
+| `OnInsert(fn)` | Fires `(entry, index)` when an entry is inserted |
+| `OnRemove(fn)` | Fires `(entry, index)` when an entry is removed |
+
+## MapOf — Typed-Key Containers
+
+`Scribe.DictOf` is string-keyed. When the keys are user IDs, numeric item IDs, or anything else numeric, use `Scribe.MapOf` to declare the key type so you never coerce at every boundary.
+
+```lua
+Friends = Scribe.MapOf("integer", {
+    Name     = Scribe.String("", { MaxLength = 32 }),
+    LastSeen = Scribe.Int(0, { Min = 0 }),
+}),
+```
+
+```lua
+-- no tostring or tonumber needed
+data.Friends[ben.UserId].Name.Set("Ben")
+data.Friends[ben.UserId].LastSeen.Set(os.time())
+```
+
+The declared key type is not just sugar. A DataStore serializes every object key to a JSON string, so an integer-keyed map would otherwise come back holding `"123"` where it stored `123`. Scribe restores the keys on load because it knows the declared type.
+
+<Warning>
+  Fractional, infinite, and NaN keys are refused at the write site. A key that is not a canonical integer spelling (such as `"07"`) is left as-is on load rather than relocated, since this map never wrote it.
+</Warning>
+
+`MaxKeyLength` applies to string keys only and is refused on an integer map. It counts **bytes**, not characters — a three-character CJK key is nine bytes and trips a `MaxKeyLength` of eight.
+
+## SetOf — Unique Membership
+
+`Scribe.SetOf` is for membership rather than order: regions unlocked, quests completed, rewards claimed. Every element must be a scalar (`Scribe.Int`, `Scribe.Number`, `Scribe.String`, or `Scribe.Enum`).
+
+```lua
+Unlocked = Scribe.SetOf(Scribe.String("", { MaxLength = 32 }), { MaxItems = 64 }),
+```
+
+```lua
+data.Unlocked.Add("AshfallRidge")       --> true  (newly added)
+data.Unlocked.Add("AshfallRidge")       --> false (already present, no write)
+data.Unlocked.Has("AshfallRidge")       --> true
+data.Unlocked.Remove("AshfallRidge")    --> true  (removed)
+data.Unlocked.Count()                   --> 0
+data.Unlocked.Clear()
+```
+
+`Add` on a value already present, and `Remove` on one that is absent, both return `false` and do nothing at all — no write, no replication, no `Changed`. This makes `Add` a safe idempotent grant:
+
+```lua
+if data.Unlocked.Add(regionId) then
+    data.Xp.Increment(250)   -- only fires on the first discovery
+end
+```
+
+<Note>
+  Sets have no positional `Insert` and no index-based `Remove`, because a set has no positions. `Evict` does not apply either.
+</Note>
+
+## Flags — Named Booleans
+
+`Scribe.Flags` holds a **fixed, declared** set of booleans in one field, addressed by member name. Every mutation to the set is one write and one `Changed`, rather than one per flag.
+
+```lua
+Settings = Scribe.Flags({ "Music", "Sfx", "TutorialDone" }),
+```
+
+```lua
+data.Settings.Enable("Music")
+data.Settings.Enable("Sfx")
+data.Settings.Has("Music")         --> true
+data.Settings.Toggle("Sfx")        --> false (new state)
+data.Settings.Disable("Music")
+data.Settings.Enable("TutorialDone")
+data.Settings.Get()                --> { "TutorialDone" }
+data.Settings.Clear()              -- every flag off
+```
+
+`Enable`, `Disable`, `Toggle`, and `Has` each take a **member name**. `Clear` takes none. Enabling a name that is not a declared member is an error rather than a silent no-op, and setting a flag to the state it already holds writes nothing at all — no replication, no `Changed`.
+
+<Accordion title="Why Flags over three sibling booleans?">
+  Three separate boolean fields produce three writes, three `Changed` fires, and three chances to use a field name your template never declared. A `Flags` field is one write, one `Changed`, a compile-time list of legal member names, and it packs to a bitmask on the wire. The cap is 32 members, enforced at template compile time.
+
+  The value is stored as the **enabled member names** in declaration order, so reordering or removing members in a later release is safe. Only the wire packing is positional, and both ends of a replication frame always come from the same build.
+</Accordion>
+
+## OnChildChanged
+
+`OnChildChanged` fires once per write on a direct child, regardless of batching, and receives the key, the new value, and the old value.
+
+```lua
+data.Inventory.OnChildChanged(function(itemId, new, old)
+    refreshSlot(itemId, new)
+end)
+
+data.Inventory.OnKeyAdded(function(itemId, entry)
+    playPickupSound(itemId, entry.Rarity)
+end)
+
+data.Inventory.OnKeyRemoved(function(itemId, entry)
+    clearSlot(itemId)
+end)
+```
+
+`Changed` fires once per batch; `OnChildChanged` fires once per write. All `OnChildChanged` fires for a given batch arrive before the container's `Changed`, so you can accumulate keys and act once at the end.
+
+<Warning>
+  Never yield inside `OnChildChanged`, `OnKeyAdded`, `OnKeyRemoved`, `OnInsert`, or `OnRemove`. These fire immediately — including inside any open `Transaction`. A handler that yields closes the transaction's thread and **rolls back the whole transaction**, including the write that triggered the handler. Keep these listeners synchronous and cheap; do async work in a `task.spawn` after the transaction returns.
+</Warning>
+
+## Declarator Options
+
+<Tabs>
+  <Tab title="ArrayOf options">
+    | Option | Type | Meaning |
+    |---|---|---|
+    | `MaxItems` | number | Maximum number of entries; a write at capacity is an error unless `Evict` is set |
+    | `Evict` | `"Front"` \| `"Back"` | Which end to drop when full; requires `MaxItems` |
+  </Tab>
+  <Tab title="DictOf / MapOf options">
+    | Option | Type | Meaning |
+    |---|---|---|
+    | `MaxKeys` | number | Maximum number of entries |
+    | `MaxKeyLength` | number | Maximum byte length of a string key (DictOf only) |
+  </Tab>
+  <Tab title="SetOf options">
+    | Option | Type | Meaning |
+    |---|---|---|
+    | `MaxItems` | number | Maximum number of members |
+  </Tab>
+</Tabs>
+
+<Note>
+  The `opts` table itself is closed: passing an unknown key is a startup error rather than a silently uncapped container.
+</Note>
+
+## Element Rules
+
+A few rules apply to every container element shape:
+
+- **Records are closed.** A field the shape does not declare is a write error.
+- **Omitted fields fill from their defaults.** `data.Inventory.Torch.Set({ Rarity = "Common" })` stores the declared `Qty` default too.
+- **Caps reject by default.** Only `Evict` on `ArrayOf` converts a cap into a rolling window.
+- **Method names are reserved.** An element field named `Count`, `Get`, `Set`, `Insert`, and so on is shadowed by the accessor method and unreachable through the typed API. Scribe logs `API_NAME_COLLISION`.
+
+## Where to Next
+
+<CardGroup cols={2}>
+  <Card title="Values" icon="pencil" href="/guides/values">
+    The full accessor surface: Get, Set, Observe, Changed, and more.
+  </Card>
+  <Card title="Replication" icon="arrows-rotate" href="/guides/replication">
+    How container diffs travel to the client automatically.
+  </Card>
+  <Card title="Templates" icon="code" href="/guides/templates">
+    The scalar declarators that go inside an element shape.
+  </Card>
+  <Card title="Transactions" icon="rotate" href="/guides/transactions">
+    Making multiple container writes all-or-nothing.
+  </Card>
+</CardGroup>

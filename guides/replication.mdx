@@ -1,0 +1,239 @@
+---
+title: "Automatic Data Replication to Clients in Scribe"
+sidebarTitle: "Replication"
+description: "Learn how Scribe auto-replicates player data to clients using schema-compressed diffs, ServerOnly visibility, custom transports, and outbound byte limits."
+---
+
+Scribe replicates player data to the owning client automatically. You never wire up a `RemoteEvent` yourself, never serialize a table by hand, and never decide which fields changed — Scribe does all of that on every heartbeat, sending only what actually moved. On the client, reads are instant and `Observe`/`Changed` fire locally as soon as the diff lands. This guide explains how the system works, how to control which fields replicate, and how to plug in a custom transport.
+
+## How Replication Works
+
+Scribe derives an identical schema on the server and the client from your shared template module. On every `PostSimulation` step the server collects the writes that accumulated since the last flush, schema-compresses them into a minimal binary diff, and sends that diff to each player whose data changed. The client applies the diff to a local mirror and fires the appropriate `Changed` and `Observe` callbacks.
+
+A few properties follow from this design:
+
+- **No idle traffic.** If nothing changed for a player, no frame is sent.
+- **Writes coalesce per frame.** Setting a field twice in the same frame sends only the final value.
+- **Reads are local.** `data.Coins.Get()` on the client never yields and never makes a network call — it reads the local mirror.
+- **The client converges to the current value, not an event log.** If you set `Coins` to 5 and then to 10 while the client is still handshaking, the client's first value is 10, never 5.
+
+## ServerOnly Fields
+
+Wrap any root field in `Scribe.ServerOnly` to exclude it from all client diffs. The field is saved and writable on the server, but it is absent from the client's accessor type — a read attempt there is a compile-time type error, not a runtime `nil`.
+
+```lua
+local template = {
+    Coins = Scribe.Int(0, { Min = 0 }),          -- saved, client sees it
+
+    AntiCheat = Scribe.ServerOnly({              -- saved, nobody sees it
+        Strikes = Scribe.Int(0, { Min = 0 }),
+    }),
+}
+```
+
+`ServerOnly` may also wrap a single nested field inside a container element shape, stripping just that field from every entry the client receives:
+
+```lua
+Inventory = Scribe.DictOf({
+    Qty      = Scribe.Int(1, { Min = 1, Max = 999 }),
+    Rarity   = Scribe.Enum("Common", RARITIES),
+    RollSeed = Scribe.ServerOnly(Scribe.Int(0)),  -- never leaves the server
+}, { MaxKeys = 200 }),
+```
+
+<Note>
+  `Shared` and `Session` are root-only wrappers. `ServerOnly` is the only wrapper that also works inside a container element shape.
+</Note>
+
+## The Client Accessor API
+
+On the client, the accessor tree lives directly on the `Client` module. The field methods are **identical** to the server — `Get`, `Set`, `Observe`, `Changed`, `Increment`, and every container method work the same way.
+
+```lua
+-- client
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Data = require(ReplicatedStorage.Shared.GameData).Client
+
+Data.Coins.Observe(function(coins)
+    coinsLabel.Text = tostring(coins)
+end)
+
+print(Data.Level.Get())   --> current value from the mirror
+```
+
+<Warning>
+  Client writes — `Data.Coins.Set(5)` — update the local mirror only and are **never** sent to the server. They are useful for optimistic UI but the server's value always wins on the next diff. To change data authoritatively from the client, use a server [Command](/guides/commands).
+</Warning>
+
+## WaitForData on the Client
+
+`Data.WaitForData(timeout?)` yields until the first Init snapshot arrives and returns `true`, or returns `false` if the default 30-second timeout expires. Use it to gate startup logic.
+
+```lua
+if Data.WaitForData() then
+    showMainMenu(Data.Level.Get())
+else
+    warn("Data did not arrive in time")
+end
+```
+
+For reactive UI, you do not need to wait at all. Subscribe with `Observe` and the callback fires with real data the moment the snapshot lands.
+
+## The Default Transport
+
+By default Scribe creates two `RemoteEvent` instances inside a folder in `ReplicatedStorage` — one for server-to-client diffs and one for client-to-server commands. This is the `"Default"` transport and requires no configuration. Most games never need to change it.
+
+If your game already runs a custom networking layer, you can route Scribe's traffic through it by implementing a `ScribeTransport` adapter.
+
+## Custom Transports
+
+A custom transport is a table that matches the `Scribe.ScribeTransport` type. Pass it as the `Transport` option when constructing the bundle.
+
+```lua
+export type ScribeTransport = {
+    Name: string,
+    MaxFrameBytes: number?,           -- optional: this channel's own ceiling
+    -- Server side
+    SendToClient:    (self: any, player: Player, bytes: buffer) -> (),
+    SendToAllClients: ((self: any, bytes: buffer) -> ())?,  -- optional broadcast
+    ListenServer:    (self: any, callback: (player: Player, bytes: buffer) -> ()) -> (),
+    -- Client side
+    SendToServer:    (self: any, bytes: buffer) -> (),
+    ListenClient:    (self: any, callback: (bytes: buffer) -> ()) -> (),
+    Release:         ((self: any) -> ())?,  -- optional: called by Data.Stop()
+}
+```
+
+Here is a minimal adapter that wraps a buffer-typed remote from a packet library:
+
+```lua
+-- ReplicatedStorage/Shared/EmberfallTransport
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Scribe = require(ReplicatedStorage.Packages.Scribe)
+
+local EmberfallPacket = Packet("EmberfallData", Packet.Buffer)
+
+return {
+    Name = "EmberfallPacket",
+    SendToClient = function(_, player, bytes)
+        EmberfallPacket:FireClient(player, bytes)
+    end,
+    SendToServer = function(_, bytes)
+        EmberfallPacket:Fire(bytes)
+    end,
+    ListenServer = function(_, cb)
+        EmberfallPacket.OnServerEvent:Connect(function(player, bytes)
+            if typeof(bytes) == "buffer" then cb(player, bytes) end
+        end)
+    end,
+    ListenClient = function(_, cb)
+        EmberfallPacket.OnClientEvent:Connect(function(bytes)
+            if typeof(bytes) == "buffer" then cb(bytes) end
+        end)
+    end,
+} :: Scribe.ScribeTransport
+```
+
+Then pass it to the bundle constructor:
+
+```lua
+return Scribe({
+    Template = template,
+    Transport = require(ReplicatedStorage.Shared.EmberfallTransport),
+    ProfileStoreIndex = "PlayerData",
+    ProfileKeyPrefix = "PLAYER_",
+})
+```
+
+### The Five Transport Rules
+
+<Accordion title="1. Deliver buffer payloads only">
+  Your listeners are the type gate. Check `typeof(bytes) == "buffer"` and drop anything else, on both realms. A `RemoteEvent` lets a client fire any type, and Scribe calls `buffer.len` before the guarded decode — a non-buffer payload throws inside your own connection instead of being counted as a `MALFORMED_FRAME`.
+</Accordion>
+
+<Accordion title="2. The channel must be reliable and ordered">
+  Scribe sends diffs that build on each other. A dropped or reordered packet corrupts the client mirror. Use a reliable `RemoteEvent` or your library's reliable channel — never an unreliable one.
+</Accordion>
+
+<Accordion title="3. Send methods must not yield">
+  Scribe calls `SendToClient` from inside the per-frame flush. A send that parks there stalls every other player's flush for that frame. Buffer internally and return immediately if your library needs it.
+</Accordion>
+
+<Accordion title="4. Sender identity comes from the engine callback">
+  In `ListenServer`, the `player` your callback receives is authoritative. Do not read a user ID out of the bytes. This is what makes commands spoof-proof.
+</Accordion>
+
+<Accordion title="5. No single call exceeds MaxOutboundBytes">
+  Anything larger than `MaxOutboundBytes` (65,536 by default) is split by Scribe and reassembled by the client. Never add your own chunking inside the adapter — fragments arriving out of order are discarded.
+</Accordion>
+
+### MaxFrameBytes
+
+If your channel cannot carry 64 KB, declare `MaxFrameBytes` on the transport itself:
+
+```lua
+return {
+    Name = "Base64Bridge",
+    MaxFrameBytes = 49152,  -- 65536 bytes ÷ 4/3 base64 expansion
+    -- ... rest of adapter
+} :: Scribe.ScribeTransport
+```
+
+Scribe takes the **smaller** of `MaxOutboundBytes` and `MaxFrameBytes`, so declaring one can only narrow the budget and never widen it.
+
+## MaxOutboundBytes and MaxInboundBytes
+
+Two configuration options bound the per-frame byte sizes.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `MaxOutboundBytes` | 65,536 | Maximum bytes per outbound diff frame. Larger frames are split and reassembled. |
+| `MaxInboundBytes` | derived | Coarse per-player ceiling on raw inbound frame rate; frames above the rate are dropped silently |
+
+```lua
+Scribe({
+    Template = template,
+    ProfileStoreIndex = "PlayerData",
+    ProfileKeyPrefix = "PLAYER_",
+    MaxOutboundBytes = 32768,   -- narrower budget for constrained channels
+})
+```
+
+<Note>
+  `MaxOutboundBytes` controls splitting, not total data size. A large Init snapshot (the player's full profile on join) will always be split correctly if it exceeds the limit; the client reassembles it transparently.
+</Note>
+
+## Multiple Bundles
+
+If your game runs two Scribe bundles, give each one its own channel with `TransportChannel = "SomeName"`, or a distinct custom transport, so their traffic does not collide.
+
+```lua
+local PlayerData = Scribe({
+    Template = playerTemplate,
+    ProfileStoreIndex = "PlayerData",
+    TransportChannel = "PlayerData",
+})
+
+local GuildData = Scribe({
+    Template = guildTemplate,
+    ProfileStoreIndex = "GuildData",
+    TransportChannel = "GuildData",
+})
+```
+
+## Where to Next
+
+<CardGroup cols={2}>
+  <Card title="Values" icon="pencil" href="/guides/values">
+    Reading and writing fields with the same API on both realms.
+  </Card>
+  <Card title="Commands" icon="terminal" href="/guides/commands">
+    The one way a client changes data authoritatively.
+  </Card>
+  <Card title="Security" icon="shield" href="/guides/security">
+    What ServerOnly does and does not protect.
+  </Card>
+  <Card title="Diagnostics" icon="chart-bar" href="/guides/diagnostics">
+    Frame counters, join bytes, and transport health logs.
+  </Card>
+</CardGroup>

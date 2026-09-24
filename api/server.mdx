@@ -1,0 +1,578 @@
+---
+title: "Server API Reference for Scribe"
+sidebarTitle: "Server"
+description: "Complete reference for Scribe's Server API: player data, persistence, commands, leaderboards, monetization, exchanges, messaging, and signals."
+---
+
+The `Server` API is the `bundle.Server` half returned by `Scribe(options)`. It manages player profiles end-to-end: loading, saving, replication, monetization, leaderboards, exchanges, and server-to-server messaging. Index the object with a `Player` instance directly — `Data[player]` — to get that player's typed accessor tree.
+
+<Note>
+  All Server methods must be called from server-side `Script`s. Calling them from a `LocalScript` will error. Methods marked **yields** suspend the calling thread until they complete.
+</Note>
+
+---
+
+## Player Data
+
+### `Server.WaitForData(player, timeout?)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+Yields until the player's profile is `Ready`, then returns their accessor tree. This is the safe way to read data in `PlayerAdded`.
+
+```lua
+local data, reason = Data.WaitForData(player, 60)
+if not data then
+    warn("Data unavailable:", reason)
+    return
+end
+print(data.Coins.Get())
+```
+
+<ParamField body="player" type="Player" required>The player to wait for.</ParamField>
+<ParamField body="timeout" type="number">Maximum seconds to wait. Default `60`.</ParamField>
+
+<ResponseField name="data" type="PlayerData<T>?">
+  The typed accessor tree, or `nil` on failure.
+</ResponseField>
+<ResponseField name="reason" type="LifecycleReason?">
+  The failure reason when `data` is `nil`. See [`LifecycleReason`](/api/types#lifecyclereason).
+</ResponseField>
+
+---
+
+### `Server.Get(player)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Returns the player's accessor tree. Errors if the profile is not `Ready`. Prefer `WaitForData` on join; use this inside command handlers, which only run once the caller is `Ready`.
+
+<ParamField body="player" type="Player" required></ParamField>
+<ResponseField name="data" type="PlayerData<T>">The typed accessor tree.</ResponseField>
+
+<Note>`Data[player]` is shorthand for `Data.Get(player)`. Both error if the profile is not Ready.</Note>
+
+---
+
+### `Server.GetState(player)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Returns the player's session state without yielding.
+
+<ParamField body="player" type="Player" required></ParamField>
+<ResponseField name="state" type='"Loading" | "Ready" | "SessionEnded"'>Current state.</ResponseField>
+<ResponseField name="phase" type="LoadPhase?">Loading phase, non-nil only while `state == "Loading"`.</ResponseField>
+
+---
+
+## Writes
+
+### `Server.Batch(player, fn)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Runs `fn` as a batch: every write inside coalesces into a single replication flush and one `Changed` pass per container.
+
+```lua
+Data.Batch(player, function()
+    state.Index.Set(i + 1)
+    state.StartedAt.Set(0)
+    state.Current.Set(next)
+end)
+-- state.Changed fires ONCE with the end state
+```
+
+<ParamField body="player" type="Player" required></ParamField>
+<ParamField body="fn" type="() -> ()" required>The write callback. Must not yield.</ParamField>
+
+---
+
+### `Server.Transaction(player, fn)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Runs `fn` atomically. If it throws, every write inside is rolled back. On success returns `(true, nil)`.
+
+```lua
+local ok, err = Data.Transaction(player, function()
+    data.Coins.Decrement(cost)
+    data.Inventory.Insert({ Id = itemId })
+end)
+if not ok then warn("Transaction failed:", err) end
+```
+
+<ParamField body="player" type="Player" required></ParamField>
+<ParamField body="fn" type="() -> ()" required>Must not yield. A yield is refused and rolled back.</ParamField>
+
+<ResponseField name="ok" type="boolean">Whether the transaction committed.</ResponseField>
+<ResponseField name="reason" type="string?">Error description on failure.</ResponseField>
+
+<Warning>
+  Atomic in memory only — `true` means writes landed on the player's tree, not that they are saved to disk. Pair with `Server.Flush` when durability is required before acknowledging.
+</Warning>
+
+---
+
+## Persistence
+
+### `Server.Flush(player, opts?)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+Saves the player's pending changes and waits for confirmation.
+
+```lua
+local saved = Data.Flush(player)
+if not saved then
+    warn("Save not confirmed; keep the operation pending")
+end
+```
+
+<ParamField body="player" type="Player" required></ParamField>
+<ParamField body="opts" type="{ Force: boolean?, Timeout: number? }">
+  `Timeout` limits the confirmation wait in seconds (default `15`). `Force = true` bypasses the already-saved shortcut and a blocked wipe guard.
+</ParamField>
+
+<ResponseField name="boolean" type="boolean">
+  `true` when the save is confirmed. `false` when confirmation did not arrive in time — a timed-out save can still finish later.
+</ResponseField>
+
+---
+
+### `Server.GetSaveInfo(player)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Returns the player's current save state for "Saving… / Saved ✓" UI.
+
+<ResponseField name="SaveInfo" type="SaveInfo">
+  See [`SaveInfo`](/api/types#saveinfo).
+</ResponseField>
+
+---
+
+### `Server.GetOffline(userId)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+Returns a read-only snapshot of a user's raw profile data. For a `Ready` player on this server, clones the live data. Otherwise reads the last saved data.
+
+<ParamField body="userId" type="number" required></ParamField>
+<ResponseField name="data" type="{ [string]: any }?">Raw profile data, or `nil` on failure or absence.</ResponseField>
+
+---
+
+### `Server.UpdateOffline(userId, fn, opts?)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+Edits an existing offline profile and saves the result. Requires the player to be offline on every server. The callback receives a plain data table, not the typed accessor tree.
+
+```lua
+local ok, reason, findings = Data.UpdateOffline(userId, function(data)
+    data.Coins = 100
+end, { Validate = true })
+if not ok then warn("Offline edit refused:", reason) end
+```
+
+<ParamField body="userId" type="number" required></ParamField>
+<ParamField body="fn" type="(data: { [string]: any }) -> ()" required>Receives a plain data table. May yield.</ParamField>
+<ParamField body="opts" type="{ Validate: boolean? }">
+  `Validate = true` checks the result against the template, refusing invalid changes with path-level findings.
+</ParamField>
+
+<ResponseField name="ok" type="boolean">`true` when the edit was saved.</ResponseField>
+<ResponseField name="reason" type="string?">Explanation on failure.</ResponseField>
+<ResponseField name="findings" type="{ { Path, Kind, Detail } }?">Validation violations, each with `Path`, `Kind`, and `Detail`.</ResponseField>
+
+---
+
+### `Server.ListVersions(userId, limit?)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+Lists a profile's DataStore version history.
+
+<ParamField body="userId" type="number" required></ParamField>
+<ParamField body="limit" type="number">Maximum entries to return.</ParamField>
+<ResponseField name="versions" type="{ { VersionId: string, CreatedAt: number, Size: number? } }">Version records, newest first.</ResponseField>
+
+---
+
+### `Server.GetVersion(userId, versionId)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+Reads the raw data of a specific historical version.
+
+<ParamField body="userId" type="number" required></ParamField>
+<ParamField body="versionId" type="string" required></ParamField>
+<ResponseField name="data" type="{ [string]: any }?">Raw snapshot, or `nil` on failure.</ResponseField>
+
+---
+
+### `Server.RestoreVersion(userId, versionId, opts?)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+Restores a profile to a historical version. Fails closed when the user has a live session anywhere. The reserved `_Scribe` root (receipts, perks, cooldowns) is preserved from the live profile by default.
+
+<ParamField body="userId" type="number" required></ParamField>
+<ParamField body="versionId" type="string" required></ParamField>
+<ParamField body="opts" type="{ RollBackReserved: boolean? }">
+  `RollBackReserved = true` also restores the `_Scribe` root. Use only to repair a corrupt reserved root.
+</ParamField>
+
+<ResponseField name="ok" type="boolean"></ResponseField>
+<ResponseField name="reason" type="string?">Explanation on failure.</ResponseField>
+
+---
+
+### `Server.Erase(userId)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+Deletes a user's profile and their leaderboard entries (GDPR deletion). Requires no live session. Retrying the same user resumes recorded cleanup progress.
+
+<ParamField body="userId" type="number" required></ParamField>
+<ResponseField name="ok" type="boolean">`true` on completion.</ResponseField>
+<ResponseField name="reason" type="string?">Explanation when incomplete.</ResponseField>
+
+---
+
+### `Server.Export(userId)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+GDPR data export: serializes a profile to a JSON string (buffers base64-encoded).
+
+<ParamField body="userId" type="number" required></ParamField>
+<ResponseField name="json" type="string?">JSON string, or `nil` if the profile is absent or the export fails.</ResponseField>
+
+---
+
+## Commands
+
+### `Server.Command(name, spec, handler)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Registers a named command clients can call via `Client.Request`. Sender identity is always the real player. Args are shape-validated and rate-limited, and the handler only runs once the caller is `Ready`.
+
+```lua
+Data.Command("EquipItem", { Args = { "string" } }, function(player, itemId)
+    if not Data[player].Inventory[itemId].Get() then return false, "not owned" end
+    Data[player].Equipped.Set(itemId)
+    return true
+end)
+
+Data.Command("CreateSaveSlot", {
+    Args = { Scribe.Int(1, { Min = 1, Max = 4 }) },
+}, function(player, slotNumber)
+    -- slotNumber is an integer in [1, 4]; out-of-range was refused already
+end)
+```
+
+<ParamField body="name" type="string" required>The command name clients pass to `Client.Request`.</ParamField>
+<ParamField body="spec" type="{ Args: { any }?, Idempotent: boolean? } | handler" required>
+  A spec table, or the handler function directly (spec defaults to no args). Each `Args` entry is a type string (`"string"`, `"number?"`), a Scribe declarator, or a shape table.
+</ParamField>
+<ParamField body="handler" type="(player: Player, ...any) -> ...any">
+  The handler function. Omit when `spec` is the handler.
+</ParamField>
+
+<Tip>
+  `Idempotent = true` makes the command require a caller-supplied key sent with `Client.RequestOnce`. The handler runs at most once per key, and every repeat is answered with the original reply.
+</Tip>
+
+---
+
+## Leaderboards
+
+### `Server.GetLeaderboard(name, limit?, offset?)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Returns the cached top-N of a board. Never triggers a live OrderedDataStore read.
+
+<ParamField body="name" type="string" required>Board name declared in `Leaderboards`.</ParamField>
+<ParamField body="limit" type="number">Maximum entries to return.</ParamField>
+<ParamField body="offset" type="number">`0` for the current period, `-1` for the previous (periodic boards only).</ParamField>
+
+<ResponseField name="entries" type="{ LeaderboardEntry }">See [`LeaderboardEntry`](/api/types#leaderboardentry).</ResponseField>
+
+---
+
+### `Server.GetMyRank(player, name)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+The player's current rank on a board, or `nil` if unranked.
+
+---
+
+### `Server.GetLeaderboardStatus(name)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Read and write health for one board without making a DataStore request.
+
+<ResponseField name="info" type="LeaderboardStatusInfo?">See [`LeaderboardStatusInfo`](/api/types#leaderboardstatusinfo).</ResponseField>
+
+---
+
+### `Server.GetLeaderboardResetIn(name)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Seconds until a periodic board resets, or `nil` for non-periodic boards.
+
+---
+
+### `Server.GetLeaderboardRefreshIn(name)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Seconds until the board next reads its store. `0` while a due refresh is waiting on the request budget. `nil` until the first cycle is scheduled.
+
+---
+
+## Monetization
+
+### `Server.Purchase(player, spec)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Atomic soft-currency purchase: debits `Cost`, runs `Grant`, and logs the transaction. All or nothing — insufficient funds or a throwing `Grant` rolls everything back.
+
+```lua
+local ok, reason = Data.Purchase(player, {
+    Cost  = { Path = "Coins", Amount = 500 },
+    ItemId = "Police01",
+    Grant = function(data) data.Vehicles.Insert("Police01") end,
+})
+```
+
+<ParamField body="player" type="Player" required></ParamField>
+<ParamField body="spec" type="PurchaseSpec" required>See [`PurchaseSpec`](/api/types#purchasespec).</ParamField>
+<ResponseField name="ok" type="boolean"></ResponseField>
+<ResponseField name="reason" type="string?">A [`PurchaseReason`](/api/types#purchasereason) string on failure.</ResponseField>
+
+---
+
+### `Server.RecordPurchase(player, entry)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Records a purchase in the player's log without debiting. Use it for external grant flows that already handled the debit.
+
+---
+
+### `Server.PromptPurchase(player, productName)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Opens Roblox's purchase prompt for a declared product or pass.
+
+<ParamField body="player" type="Player" required></ParamField>
+<ParamField body="productName" type="string" required>Name declared in `Products` or `Passes`.</ParamField>
+<ResponseField name="ok" type="boolean">`true` means the prompt call succeeded, not that the player purchased.</ResponseField>
+<ResponseField name="reason" type="string?">Refusal reason on failure.</ResponseField>
+
+---
+
+### `Server.HandleReceipt(receipt)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Idempotent receipt handler. Bind to `MarketplaceService.ProcessReceipt`. Returns `Enum.ProductPurchaseDecision`.
+
+---
+
+### `Server.TryHandleReceipt(receipt)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Like `HandleReceipt`, but returns `nil` for a product Scribe does not manage, so you can chain it with your own handler.
+
+---
+
+### `Server.GetProductState(player, name)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+The state of a declared product or pass for one player.
+
+<ResponseField name="state" type="ProductState">See [`ProductState`](/api/types#productstate).</ResponseField>
+
+---
+
+### `Server.Owns(player, key)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Whether the player owns a perk or pass, from the in-memory mirror. Non-yielding; may be stale for a pass bought seconds ago.
+
+---
+
+### `Server.OwnsAsync(player, key, timeout?)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+Authoritative and yielding. Calls `UserOwnsGamePassAsync` for passes so a pass bought moments ago reads correctly. Use this to gate grants.
+
+---
+
+### `Server.ObserveOwned(player, key, callback)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Calls `callback(owned)` immediately and again whenever ownership of `key` changes for `player`. Returns a `Disconnect`.
+
+---
+
+### `Server.GrantPerk(player, key)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Grants a perk directly, for admin or reward flows.
+
+---
+
+### `Server.RevokePerk(player, key)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Revokes a granted perk.
+
+---
+
+### `Server.GetPurchases(player, filter?)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Returns the player's purchase history. See [`PurchaseFilter`](/api/types#purchasefilter) for filter options.
+
+---
+
+## Gifting
+
+### `Server.PromptGift(player, productName, recipientId)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Opens a gift purchase prompt. The buyer pays with Robux; the recipient receives the grant.
+
+<ParamField body="player" type="Player" required>The buyer.</ParamField>
+<ParamField body="productName" type="string" required>A declared product that supports gifting.</ParamField>
+<ParamField body="recipientId" type="number" required>The recipient's UserId.</ParamField>
+<ResponseField name="ok" type="boolean"></ResponseField>
+<ResponseField name="reason" type="GiftReason?">See [`GiftReason`](/api/types#giftreason).</ResponseField>
+
+---
+
+### `Server.GetGiftCredits(player)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Returns the player's unassigned gift credits by product name.
+
+<ResponseField name="credits" type="{ [string]: number }">Product name → credit count.</ResponseField>
+
+---
+
+## Cooldowns
+
+### `Server.OnCooldown(player, key, duration, opts?)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Checks and optionally starts a named cooldown. If the cooldown is not active, starts it and returns `(false, 0)`. If active, returns `(true, remaining)`.
+
+```lua
+Data.OnCooldown(player, "DailyChest", 86400)                           -- ticks while offline
+Data.OnCooldown(player, "Boost", 3600, { IncludeOfflineTime = false }) -- pauses while offline
+```
+
+<ParamField body="player" type="Player" required></ParamField>
+<ParamField body="key" type="string" required>A name you choose; unique per player.</ParamField>
+<ParamField body="duration" type="number" required>Cooldown length in seconds.</ParamField>
+<ParamField body="opts" type="{ IncludeOfflineTime: boolean? }">
+  `IncludeOfflineTime = false` pauses the cooldown while the player is offline.
+</ParamField>
+
+<ResponseField name="onCooldown" type="boolean">`true` when still cooling down.</ResponseField>
+<ResponseField name="remaining" type="number">Seconds remaining, or `0` when it just started.</ResponseField>
+
+---
+
+### `Server.PeekCooldown(player, key)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Reads cooldown state without starting it.
+
+<ResponseField name="onCooldown" type="boolean"></ResponseField>
+<ResponseField name="remaining" type="number">Seconds remaining, or `0` when inactive.</ResponseField>
+
+---
+
+### `Server.ClearCooldown(player, key)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Removes a named cooldown immediately.
+
+---
+
+## Exchanges
+
+The `Server.Exchange` sub-table provides the full player-to-player item exchange API.
+
+### `Server.Exchange.Attempt(playerA, basketA, playerB, basketB)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+Exchanges two baskets between players on this server. Each basket lists what that player gives.
+
+```lua
+local outcome, why = Data.Exchange.Attempt(alice, {
+    { Path = { "Inventory" }, Kind = "Key", Key = "Emberblade" },
+    { Path = { "Coins" }, Kind = "Qty", Amount = 250 },
+}, bob, {
+    { Path = { "Inventory" }, Kind = "Key", Key = "Frostbrand" },
+})
+if outcome ~= "Committed" then
+    return false, why
+end
+```
+
+<ParamField body="playerA" type="Player" required></ParamField>
+<ParamField body="basketA" type="{ ExchangeLeg }" required>What player A gives. See [`ExchangeLeg`](/api/types#exchangeleg).</ParamField>
+<ParamField body="playerB" type="Player" required></ParamField>
+<ParamField body="basketB" type="{ ExchangeLeg }" required>What player B gives.</ParamField>
+
+<ResponseField name="outcome" type='"Committed" | "Aborted" | nil'>
+  `"Committed"` means each basket is owed to the other player. `"Aborted"` means it is owed back to its original owner. `nil` means an early refusal or unknown verdict.
+</ResponseField>
+<ResponseField name="reason" type="string?">Explanation on refusal or `nil` outcome.</ResponseField>
+
+---
+
+### `Server.Exchange.Open(player)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Returns what this player has in flight and what value it holds in escrow.
+
+<ResponseField name="exchanges" type="{ OpenExchange }">See [`OpenExchange`](/api/types#openexchange).</ResponseField>
+
+---
+
+### `Server.Exchange.Discard(id)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+Drops an abandoned claim that never took value. Refuses anything with a verdict or holding staked value.
+
+<ResponseField name="ok" type="boolean"></ResponseField>
+<ResponseField name="reason" type="string?"></ResponseField>
+
+---
+
+### `Server.Exchange.Settle(id, verdict)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+Forces `"Commit"` or `"Abort"` on an exchange that cannot resolve itself. `"Commit"` is additionally refused when it cannot be proved safe.
+
+<ParamField body="id" type="string" required></ParamField>
+<ParamField body="verdict" type='"Commit" | "Abort"' required></ParamField>
+
+---
+
+### `Server.Exchange.Redirect(id, userId, newKey)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+Moves a parked delivery to a different key of the same container, for deliveries that cannot apply because their destination key is taken.
+
+---
+
+## Messaging
+
+### `Server.SendMessage(userId, message)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+Sends a durable cross-server message to `userId`. Delivered to `Server.OnMessage` on whatever server they are (or next become) active on, including offline recipients. `message` must be DataStore-serializable.
+
+<ParamField body="userId" type="number" required></ParamField>
+<ParamField body="message" type="any" required>A DataStore-serializable value.</ParamField>
+<ResponseField name="committed" type="boolean">`true` means committed, not delivered. `false` does not always mean nothing was written.</ResponseField>
+
+<Warning>
+  The queue is bounded at 1,000 undelivered messages per recipient. Delivery is at-least-once — handlers must be idempotent. Give each payload its own ID and ignore repeats.
+</Warning>
+
+---
+
+### `Server.OnMessage` — Signal
+
+Fires with `(player, message)` when a cross-server message arrives for an active session.
+
+---
+
+## Signals
+
+These signals are properties on the `Server` object, not methods. Connect with `:Connect(callback)`.
+
+| Signal | Fires with | When |
+|---|---|---|
+| `Server.OnSave` | `{ Player, Ok, Duration, At }` | After each profile save |
+| `Server.SessionEnded` | `(player, reason: LifecycleReason)` | When a session ends |
+| `Server.OnAnomaly` | `{ Player, Path, Value, Reason }` | On data integrity events |
+| `Server.OnGiftReceived` | `(player, { FromUserId, Product, GiftId })` | When a gift is delivered to a player |
+| `Server.OnGiftCredit` | `(player, productName)` | When a gift credit is issued |
+| `Server.OnOwnershipChanged` | `(player, key, owned)` | When ownership of a key changes |
+| `Server.OnLeaderboard` | `(boardName, entries)` | When a leaderboard refreshes |
+| `Server.OnCooldownEnded` | `(player, key)` | When a cooldown expires |
+
+---
+
+## Control
+
+### `Server.Stop()` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Releases everything this bundle holds: the Timed sweep, leaderboard workers, replication flush, `Players` listeners, ProfileStore signal handlers, and `ProcessReceipt` if this bundle owns it. Idempotent. Does not save — call `Flush` first if the data matters.
+
+<Note>
+  A Scribe bundle normally lives for the server's lifetime. `Stop` exists for test suites and simulations that build many bundles.
+</Note>
+
+---
+
+### `Server.Raw` — Server
+
+The same API object without the typed accessor tree, for use when the type solver trips on your template.
+
+---
+
+### `Server.ProfileStore` — ProfileStore
+
+The underlying ProfileStore instance. An advanced escape hatch for store-level operations Scribe does not wrap. Bypasses Scribe's schema, replication, and session guarantees — treat as read-mostly and never mutate an active-session profile through it.

@@ -1,0 +1,263 @@
+---
+title: "Session Lifecycle and Loading States in Scribe"
+sidebarTitle: "Lifecycle"
+description: "Understand Scribe's session lifecycle — from PlayerAdded through Ready to SessionEnded — including WaitForData, GetState, load phases, and shutdown behavior."
+---
+
+A player's data takes time to load. ProfileStore must acquire a session lock, read the DataStore, run migrations, and initialize derived fields before anything is safe to read or write. Scribe tracks exactly where a player is in that pipeline and gives you tools to wait for readiness, react to failure, and clean up when the session ends. This guide covers the full lifecycle from join to leave, and every state a session can be in along the way.
+
+## The Loading Flow
+
+When a player joins the server, Scribe immediately begins loading their profile in the background. The session moves through a series of named phases before it becomes `Ready`.
+
+<Steps>
+  <Step title="PlayerAdded">
+    The player joins. Scribe begins acquiring a ProfileStore session. The session is in `Loading` state.
+  </Step>
+  <Step title="AcquiringSession">
+    ProfileStore waits for any previous server's lock to release (typically ~40 seconds after a crash or migration). `GetState` returns `("Loading", "AcquiringSession")`.
+  </Step>
+  <Step title="ReadingProfile / Retrying">
+    The DataStore read is in flight. On throttle, Scribe retries. `GetState` returns `("Loading", "ReadingProfile")` or `("Loading", "Retrying")`.
+  </Step>
+  <Step title="Initializing / Importing">
+    Migrations run, `OnPlayerInit` fires, and derived fields are evaluated. `GetState` returns `("Loading", "Initializing")` or `("Loading", "Importing")` during a legacy data import.
+  </Step>
+  <Step title="Ready">
+    The accessor tree is live. `WaitForData` returns. `Data[player]` and `Data.Get(player)` work without yielding.
+  </Step>
+  <Step title="SessionEnded">
+    The player left, another server stole the session, or a shutdown occurred. `SessionEnded` fires.
+  </Step>
+</Steps>
+
+## Waiting for Data on the Server
+
+Never read a player's data before it is ready. Use `Data.WaitForData(player, timeout?)`, which yields until the profile is `Ready` and returns `(accessor?, reason?)`.
+
+```lua
+Players.PlayerAdded:Connect(function(player)
+    local data, reason = Data.WaitForData(player)
+    if not data then
+        if reason ~= Scribe.Reason.PlayerLeft then
+            warn(`No data for {player.Name}: {reason}`)
+        end
+        return
+    end
+
+    -- data is the typed accessor tree — safe to read and write now
+    local level = Instance.new("IntValue")
+    level.Name  = "Level"
+
+    data.Level.Observe(function(value)
+        level.Value = value
+    end)
+
+    level.Parent = player
+end)
+```
+
+Once a session is `Ready`, `Data[player]` and `Data.Get(player)` return the accessor without yielding. Both **error** if the profile is still `Loading`, so always gate them behind `WaitForData` or use them inside a `Command` handler (which only runs once the caller is `Ready`).
+
+### WaitForData Return Values
+
+`reason` is a `Scribe.LifecycleReason` string, also available as named constants on `Scribe.Reason`.
+
+| Reason | `Scribe.Reason` constant | Meaning | Retryable? |
+|---|---|---|---|
+| `player-left` | `Scribe.Reason.PlayerLeft` | Player left — by far the most common, and usually not an error | No |
+| `still-loading` | `Scribe.Reason.StillLoading` | The wait elapsed while the load was still in flight. Nothing has failed | **Yes** |
+| `erasing` | `Scribe.Reason.Erasing` | Profile is being erased; the player was told to rejoin later | After erase completes |
+| `timeout` | `Scribe.Reason.Timeout` | Wait elapsed and Scribe has no session for this player at all | No |
+| `load-failed` | `Scribe.Reason.LoadFailed` | The profile could not be loaded | No |
+| `migration-failed` | `Scribe.Reason.MigrationFailed` | A migration errored; profile released unmigrated | No |
+| `session-ended` | `Scribe.Reason.SessionEnded` | Session ended while the player was still in game | No |
+| `shutdown` | `Scribe.Reason.Shutdown` | Server is closing | No |
+
+Retry `still-loading` while the player remains in the game:
+
+```lua
+local data, reason = Data.WaitForData(player)
+if not data and reason == Scribe.Reason.StillLoading then
+    -- a cross-server handoff or slow DataStore can take longer than the default 60s
+    data, reason = Data.WaitForData(player, 60)
+end
+if not data then
+    warn(`Still no data for {player.Name}: {reason}`)
+end
+```
+
+<Note>
+  `still-loading` and `timeout` are different values. `still-loading` means there is a load in progress worth waiting for. `timeout` means Scribe has no session for this player at all — typically because the bundle was constructed after they already joined.
+</Note>
+
+## Getting State Without Yielding
+
+`Data.GetState(player)` returns the current session state and loading phase without yielding. Use it to display a loading indicator or to check readiness from a non-yielding context.
+
+```lua
+local state, phase = Data.GetState(player)
+-- state: "Loading" | "Ready" | "SessionEnded"
+-- phase: LoadPhase? (nil unless Loading)
+```
+
+### All LoadPhase Values
+
+| Phase | What it means |
+|---|---|
+| `WaitingForErase` | Joining is blocked while this profile is being erased |
+| `AcquiringSession` | Waiting for a previous server's session lock to release |
+| `ReadingProfile` | DataStore read is in flight |
+| `Retrying` | DataStore read throttled; Scribe is waiting to retry |
+| `Initializing` | Migrations running, `OnPlayerInit` firing, derived fields evaluating |
+| `Importing` | `ImportLegacyData` hook is running |
+| `ImportThrottled` | `OnPlayerInit` called `AwaitBudget` and is waiting for DataStore capacity |
+
+## Client Readiness
+
+On the client, the accessor tree is always present and returns **template defaults** until the first replication snapshot arrives. For reactive UI this means you can subscribe immediately with `Observe` and your callback will fire with real data when it lands.
+
+```lua
+-- client — works before and after data loads
+Data.Coins.Observe(function(coins)
+    coinLabel.Text = tostring(coins)
+end)
+```
+
+To gate one-shot startup logic on data being present, use `Data.IsReady()` (non-yielding) or `Data.WaitForData(timeout?)` (yields and returns a boolean):
+
+```lua
+-- non-yielding check
+if Data.IsReady() then
+    showMainMenu(Data.Level.Get())
+end
+
+-- yielding check with a timeout
+if Data.WaitForData() then
+    showMainMenu(Data.Level.Get())
+else
+    warn("Data did not arrive within the timeout")
+end
+```
+
+`Data.WaitForData()` on the client returns `true` when the snapshot arrives, or `false` if the default 30-second timeout expires. It never hangs.
+
+## Session End
+
+When a session ends — whether the player left, another server stole the session, or the server is shutting down — `Data.SessionEnded` fires with `(player, reason)`.
+
+```lua
+Data.SessionEnded:Connect(function(player, reason)
+    if reason == Scribe.Reason.SessionEnded then
+        -- session was stolen by another server
+        analytics:Log("session_stolen", player.UserId)
+    end
+end)
+```
+
+With `KickOnSessionEnd = true` (the default), the player is also kicked when the session ends mid-game, so the client cannot keep acting on stale data.
+
+## OnPlayerInit
+
+`OnPlayerInit` runs once per player, right after their profile finishes loading and before they become `Ready`. It receives the player, their **raw** data table, a flag indicating whether this is a new profile, and a migration context.
+
+```lua
+Scribe({
+    Template = template,
+    ProfileStoreIndex = "PlayerData",
+    ProfileKeyPrefix = "PLAYER_",
+
+    OnPlayerInit = function(player, rawData, isNewProfile)
+        if isNewProfile then
+            rawData.Coins = 500   -- starter purse for new players
+        end
+    end,
+})
+```
+
+`isNewProfile` is `true` for a genuinely new profile, a `ResetData` wipe, and a first-session crash recovery — so you can run starter kits without keeping a sentinel field.
+
+<Warning>
+  The `rawData` table is the raw profile, not the accessor tree. Writes here bypass validation. Scribe scans the result after the hook and reports anything unstorable as `PROFILE_UNPERSISTABLE`. For fields that depend on the profile itself, prefer `Scribe.Dynamic` in the template, which runs per profile automatically.
+</Warning>
+
+## OnPlayerLeaving
+
+`OnPlayerLeaving` is the counterpart to `OnPlayerInit`. It runs **before the final save**, so whatever it writes persists. This is the correct place for accumulate-on-exit patterns like tracking playtime.
+
+```lua
+OnPlayerLeaving = function(player, data, reason)
+    local joined = joinedAt[player.UserId]
+    if joined then
+        data.Stats.Playtime.Increment(os.time() - joined)
+    end
+end,
+```
+
+You receive the same typed accessor as everywhere else, so writes are validated and bounded. The `reason` is the usual `LifecycleReason`, so you can skip expensive work during `shutdown` when the deadline is short.
+
+<Warning>
+  The hook **must not yield**. Do async work during the session and only write here. On a normal leave, a parked hook holds that player's session open for as long as it waits, delaying the final save.
+</Warning>
+
+## Stop and Shutdown
+
+`Data.Stop()` releases everything a bundle holds: the timed-field sweep, the leaderboard cycle, the per-frame replication flush, the `Players` and `MarketplaceService` listeners, and the ProfileStore signal handlers. A game never needs it — bundles are built once and live for the server's lifetime. It exists for test suites and simulations that build many bundles per process.
+
+```lua
+local bundle = Scribe({ Template = template, ProfileStoreIndex = "Test", ProfileKeyPrefix = "T_" })
+local Data = bundle.Server
+
+-- run the test ...
+
+if not Data.Flush(player) then
+    error("Save not confirmed")
+end
+Data.Stop()  -- idempotent; does NOT save
+```
+
+`Data.Stop()` is idempotent and does **not** save. Flush first if the data matters. The client has the same call — `Data.Stop()` releases the transport listener and the Hello retry loop, which a storybook that remounts a bundle per story needs to avoid stacking listeners.
+
+## Load Failure Policy
+
+The `LoadFailurePolicy` configuration option controls what Scribe does when a profile cannot load.
+
+| Policy | Behavior |
+|---|---|
+| `"Kick"` (default) | Kicks the player with a message |
+| `"Wait"` | Keeps retrying until the player leaves or the server shuts down |
+
+Use `"Wait"` in games where keeping the player in the server is preferable to a hard disconnect during a temporary DataStore outage.
+
+## Signals Reference
+
+`OnSave`, `SessionEnded`, and every other `On…` member work the same way:
+
+```lua
+local conn = Data.OnSave:Connect(function(info)
+    -- info: { Player, Ok, Duration, At }
+end)
+conn:Disconnect()
+
+Data.OnSave:Once(function(info) end)  -- runs once, then detaches
+local info = Data.OnSave:Wait()       -- yields for the next fire
+```
+
+Every handler runs on its own thread, so yielding inside one does not hold up other handlers or Scribe itself.
+
+## Where to Next
+
+<CardGroup cols={2}>
+  <Card title="Replication" icon="arrows-rotate" href="/guides/replication">
+    How data travels from server to client after loading.
+  </Card>
+  <Card title="Commands" icon="terminal" href="/guides/commands">
+    How the client asks the server to change data after loading.
+  </Card>
+  <Card title="Transactions" icon="rotate" href="/guides/transactions">
+    Making multiple writes all-or-nothing.
+  </Card>
+  <Card title="Diagnostics" icon="chart-bar" href="/guides/diagnostics">
+    Monitoring save health, load phases, and shutdown counters.
+  </Card>
+</CardGroup>

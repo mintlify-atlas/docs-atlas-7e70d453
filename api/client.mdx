@@ -1,0 +1,324 @@
+---
+title: "Client API Reference for Scribe"
+sidebarTitle: "Client"
+description: "Complete reference for Scribe's Client API: data access, requests, leaderboards, monetization, service status, shared state, and edit-mode mocks."
+---
+
+The `Client` API is the `bundle.Client` half returned by `Scribe(options)`. It gives a `LocalScript` the same typed accessor tree as the server, driven by a mirror that the server replicates automatically. Writes are **local-only and optimistic** — they do not reach the server. To change data authoritatively, call a server command via `Client.Request`.
+
+<Note>
+  All Client methods must be called from `LocalScript`s (or `ModuleScript`s required by them). Calling them from a server `Script` will error. Methods marked **yields** suspend the calling thread until they complete.
+</Note>
+
+---
+
+## Lifecycle
+
+### `Client.IsReady()` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
+
+Returns whether the first Init snapshot has arrived. Non-yielding. Before this returns `true`, accessor reads return template defaults. Always `true` in edit mode.
+
+<ResponseField name="boolean" type="boolean"></ResponseField>
+
+---
+
+### `Client.WaitForData(timeout?)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+Yields until the first Init snapshot arrives, then returns `true`. Returns `false` if `timeout` seconds (default `30`) pass first. Use it to gate startup logic; for reactive UI, prefer `Observe`/`Changed` on individual fields.
+
+```lua
+if Data.WaitForData() then
+    showMainMenu(Data.Coins.Get())
+end
+```
+
+<ParamField body="timeout" type="number">Maximum seconds to wait. Default `30`.</ParamField>
+<ResponseField name="boolean" type="boolean">`true` when data arrived, `false` on timeout.</ResponseField>
+
+---
+
+### `Client.Get()` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
+
+Returns the typed accessor tree for the local player. Reads return template defaults until the first snapshot arrives. `Data.<fieldName>` also resolves through the accessor tree via a metatable, so `Data.Coins` is equivalent to `Data.Get().Coins`.
+
+<ResponseField name="data" type="PlayerData<T>">The typed accessor tree.</ResponseField>
+
+---
+
+### `Client.Batch(fn)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
+
+Runs `fn` as a batch: every local write inside coalesces into one `Changed` pass per container. Client writes are optimistic and stay on this client; this only stops a listener firing once per write when a UI updates several fields at once.
+
+```lua
+Data.Batch(function()
+    Data.Equipped.Set("Sword")
+    Data.Inventory.Sword.Qty.Decrement(1)
+end)
+-- Data.Inventory.Changed fires ONCE
+```
+
+<ParamField body="fn" type="() -> ()" required>The write callback.</ParamField>
+
+---
+
+### `Client.Stop()` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
+
+Releases this bundle's transport listener, Hello retry loop, product-info subscriptions, and mirror tree. Idempotent. A game never needs this; a storybook or test suite that remounts bundles does.
+
+---
+
+## Requests
+
+### `Client.Request(name, ...args)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+Calls a server command registered with `Server.Command` and returns whatever its handler returned. Yields until the reply arrives, or resolves `false, "timeout"` if none comes within `RequestTimeout`.
+
+```lua
+local ok, reason = Data.Request("EquipItem", itemId)
+if not ok then
+    warn("Command failed:", reason)
+end
+```
+
+<ParamField body="name" type="string" required>The command name passed to `Server.Command`.</ParamField>
+<ParamField body="...args" type="any">Arguments forwarded to the handler after shape validation.</ParamField>
+
+<ResponseField name="...any" type="...any">
+  Whatever the handler returned. On a Scribe refusal, the result is `false`, a [`RequestReason`](/api/types#requestreason) string, and [`Scribe.RequestFailed`](/api/types#requestfailed) in a third slot. Test that third value to distinguish a framework refusal from a handler message.
+</ResponseField>
+
+---
+
+### `Client.RequestOnce(name, key, ...args)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+Like `Client.Request`, but tagged with an idempotency `key`. The server runs the handler at most once per key and replays the original reply to every repeat. Use it for operations a retry must not do twice.
+
+```lua
+local idempotencyKey = HttpService:GenerateGUID(false)
+local ok = Data.RequestOnce("ClaimReward", idempotencyKey, rewardId)
+```
+
+<ParamField body="name" type="string" required></ParamField>
+<ParamField body="key" type="string" required>
+  Non-empty, valid UTF-8, at most 64 bytes. Raises on this thread if the key is invalid — it will not send. Generate once per intent, not once per attempt.
+</ParamField>
+<ParamField body="...args" type="any"></ParamField>
+
+<Note>
+  The command must be registered `Idempotent = true`. Sending a key to a non-idempotent command, or sending without a key to an idempotent one, is refused with `"bad-idempotency-key"`.
+</Note>
+
+---
+
+## Leaderboards
+
+### `Client.GetLeaderboard(name, limit?)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
+
+Returns the cached top-N of a replicated board (`Replicate = true`), streamed to clients at handshake and on change. Empty for server-only boards.
+
+<ParamField body="name" type="string" required>Board name declared in `Leaderboards`.</ParamField>
+<ParamField body="limit" type="number">Maximum entries to return.</ParamField>
+<ResponseField name="entries" type="{ LeaderboardEntry }">See [`LeaderboardEntry`](/api/types#leaderboardentry).</ResponseField>
+
+---
+
+### `Client.GetMyRank(name)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
+
+The local player's rank on a replicated board, or `nil` if unranked.
+
+---
+
+### `Client.OnLeaderboard` — Signal
+
+Fires `(boardName, entries)` whenever a replicated board updates.
+
+---
+
+## Monetization
+
+### `Client.PromptPurchase(productName)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+Asks the server to validate and open Roblox's purchase prompt for the local player. No custom command is needed.
+
+```lua
+local opened, reason, failed = Data.PromptPurchase("CoinBag")
+if not opened then
+    warn(reason)
+end
+```
+
+<ParamField body="productName" type="string" required>A product or pass declared in `Products` / `Passes`.</ParamField>
+<ResponseField name="opened" type="boolean">`true` means the prompt call succeeded — not that the player purchased.</ResponseField>
+<ResponseField name="reason" type="string?">Refusal reason. Overlapping requests return `"purchase prompt already open"`.</ResponseField>
+<ResponseField name="failed" type="{}?">Present and equal to `Scribe.RequestFailed` when the refusal came from the Scribe framework rather than game logic.</ResponseField>
+
+---
+
+### `Client.GetProductState(productName)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
+
+The state of a declared product or pass for the local player, computed from the mirror without a round trip.
+
+<ResponseField name="state" type="ProductState">See [`ProductState`](/api/types#productstate).</ResponseField>
+
+---
+
+### `Client.ObserveProductState(productName, callback)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
+
+Calls `callback` with the current state immediately, and again whenever it changes (profile loading, policy landing, ownership changing). Returns a `Disconnect`.
+
+<ParamField body="productName" type="string" required></ParamField>
+<ParamField body="callback" type="(state: ProductState) -> ()" required></ParamField>
+
+---
+
+### `Client.GetProductInfo(productName)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
+
+Returns the Roblox product info for a declared product or pass, fetched asynchronously and cached. Returns `nil` until loaded or on failure.
+
+---
+
+### `Client.GetPrice(productName)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
+
+Returns the Robux price of a declared product or pass, or `nil` until the info is loaded.
+
+---
+
+### `Client.GetPurchases(filter?)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
+
+Returns the local player's purchase history. Only populated when the game enables `PurchaseLog.ReplicateRobux`.
+
+<ParamField body="filter" type="PurchaseFilter?">See [`PurchaseFilter`](/api/types#purchasefilter).</ParamField>
+
+---
+
+### `Client.Owns(key)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+Whether the local player owns a perk or pass, from the replicated mirror. Yields until data has loaded.
+
+---
+
+### `Client.OwnsAsync(key, timeout?)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span> <span style={{fontSize:"0.75rem", background:"#7c3aed", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"4px"}}>yields</span>
+
+Like `Owns` but waits up to `timeout` seconds for the ownership state to be confirmed via a server reply.
+
+---
+
+### `Client.ObserveOwned(key, callback)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
+
+Calls `callback(owned)` immediately and again whenever ownership of `key` changes. Returns a `Disconnect`.
+
+---
+
+### `Client.OnOwnershipChanged` — Signal
+
+Fires `(key, owned)` whenever the local player's ownership of a pass or perk changes. Does not fire for ownership already held at load — use `ObserveOwned` for the initial value.
+
+---
+
+### `Client.GetGiftCredits()` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
+
+Returns the local player's unassigned gift credits by product name.
+
+<ResponseField name="credits" type="{ [string]: number }">Product name → credit count.</ResponseField>
+
+---
+
+## Service Status
+
+### `Client.GetServiceStatus()` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
+
+The replicated data-service health. Show players a "progress may save late" notice during `"Degraded"` or `"Outage"`.
+
+<ResponseField name="status" type='"Healthy" | "Degraded" | "Outage"'></ResponseField>
+
+---
+
+### `Client.OnServiceStatus` — Signal
+
+Fires with the new status string whenever service health changes.
+
+---
+
+## Save Info
+
+### `Client.GetSaveInfo()` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
+
+The owner's replicated save state for "Saving… / Saved ✓" UI.
+
+<ResponseField name="SaveInfo" type="SaveInfo">See [`SaveInfo`](/api/types#saveinfo).</ResponseField>
+
+---
+
+## Shared State
+
+### `Client.GetShared(playerOrUserId)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
+
+Reads another player's `Scribe.Shared` roots (public info replicated to everyone), or `nil` if not yet received.
+
+<ParamField body="playerOrUserId" type="Player | number" required>The other player's `Player` instance or `UserId`.</ParamField>
+<ResponseField name="data" type="{ [string]: any }?">A snapshot of the player's Shared roots, or `nil`.</ResponseField>
+
+<Note>
+  Never returns the local player's own Shared roots. The server broadcasts Shared data to everyone except the owner, so `nil` for yourself is permanent rather than pending. Read your own fields through the ordinary accessor.
+</Note>
+
+---
+
+### `Client.OnSharedChanged` — Signal
+
+Fires `(userId, sharedData)` when another player's Shared data changes. `sharedData` is `nil` when the player leaves.
+
+---
+
+## Debug / Edit Mode
+
+These APIs are only available in edit mode (when `RunService:IsRunning()` is `false`, e.g. in a storybook or the command bar). Calling them outside edit mode raises an error.
+
+### `Client.Mock(values?, scribeState?)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
+
+Seeds mock data for edit mode. Deep-merges `values` into the mirror so components render with realistic state.
+
+```lua
+Data.Mock(
+    { Coins = 1500, Level = 12 },
+    {
+        Perks = { "VIP" },
+        GiftCredits = { CoinBag = 2 },
+        Leaderboards = { TopCoins = { { Rank = 1, UserId = 123, Name = "Ava", Score = 9999 } } },
+    }
+)
+```
+
+<ParamField body="values" type="{ [string]: any }?">Template fields to seed. Only the fields your component reads need to be set.</ParamField>
+<ParamField body="scribeState" type="{ Perks: { string }?, GiftCredits: { [string]: number }?, PurchaseLogs: { Robux: { any }?, InGame: { any }? }?, Leaderboards: { [string]: { LeaderboardEntry } }? }?">
+  Seeds the monetization and leaderboard state read by `Owns`, `GetGiftCredits`, and `GetLeaderboard`.
+</ParamField>
+
+---
+
+### `Client.MockCommand(name, handler)` <span style={{fontSize:"0.75rem", background:"#16a34a", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>client</span>
+
+Registers a fake handler so `Client.Request` resolves in edit mode without a server.
+
+```lua
+Data.MockCommand("EquipItem", function(itemId)
+    return true
+end)
+```
+
+<ParamField body="name" type="string" required>The command name.</ParamField>
+<ParamField body="handler" type="(...any) -> ...any" required>Called when `Client.Request(name, ...)` runs in edit mode.</ParamField>
+
+---
+
+## Escape Hatches
+
+### `Client.Raw` — Client
+
+The same API object without the typed accessor tree, for use when the type solver trips on your template.
+
+---
+
+### `Client.ServerStore` — table
+
+The server-owned tree as this client mirrors it, present only when the bundle declares `ServerStore`. Read and observe it like any other root — `Data.ServerStore.Wave.Get()` — with no player argument. Writes belong on the server.

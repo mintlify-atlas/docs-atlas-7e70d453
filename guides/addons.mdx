@@ -1,0 +1,361 @@
+---
+title: "Scribe Add-ons: Telemetry, Leaderstats, and UI"
+sidebarTitle: "Add-ons"
+description: "Extend Scribe with official optional add-ons for Discord health alerts, Roblox player-list stats, and reactive UI bindings for Vide, React, and Fusion."
+---
+
+Scribe ships three categories of optional add-ons maintained alongside the core library and built entirely on its public API. None of them are included in the Wally package or the core npm package — you copy in only what you need. Each add-on is versioned with Scribe and tested in its suite, so a change to the API they rely on fails CI here rather than silently breaking a copy pasted into your game.
+
+<CardGroup cols={3}>
+  <Card title="ScribeTelemetry" icon="webhook" href="#scribetelemetry">
+    Posts health summaries, failures, and performance alerts to Discord webhooks.
+  </Card>
+  <Card title="ScribeLeaderstats" icon="list-ol" href="#scribeleaderstats">
+    Syncs selected data fields to Roblox's built-in player-list leaderboard.
+  </Card>
+  <Card title="UI Adapters" icon="window" href="#ui-adapters">
+    Bridges Scribe client accessors to Vide, React, and Fusion reactive state.
+  </Card>
+</CardGroup>
+
+## ScribeTelemetry
+
+ScribeTelemetry sends profile and leaderboard health reports, errors, selected warnings, performance alerts, and periodic summaries to Discord webhooks from the server. It is server-only and uses only Scribe's public diagnostics API — one log sink, one status connection, metric readers, and cached leaderboard snapshots. It never makes DataStore requests and never changes player data.
+
+### Installing
+
+<Steps>
+  <Step title="Copy the module">
+    Copy `addons/telemetry/ScribeTelemetry/` into `ServerStorage`, or insert `ScribeTelemetry-Addon.rbxm` from the [release page](https://github.com/ericplane/Scribe/releases) there.
+  </Step>
+  <Step title="Enable HTTP requests">
+    In Experience Settings → Security, enable **HTTP Requests**. `HttpService` is what posts to Discord.
+  </Step>
+  <Step title="Create a Discord webhook">
+    In your Discord channel's settings, go to Integrations → Webhooks and create a webhook. Copy the URL.
+  </Step>
+  <Step title="Start the add-on">
+    Add a server script beside your Scribe setup:
+
+    ```lua
+    -- ServerScriptService/Telemetry.server.luau
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local ServerStorage     = game:GetService("ServerStorage")
+
+    local Scribe         = require(ReplicatedStorage.Packages.Scribe)
+    local ScribeTelemetry = require(ServerStorage.ScribeTelemetry)
+
+    ScribeTelemetry.Start(Scribe, {
+        Webhooks = {
+            Alerts = { Url = "https://discord.com/api/webhooks/<id>/<token>" },
+        },
+        Default = "Alerts",
+    })
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+  Keep the webhook URL in a server script or `ServerStorage` module — never in `ReplicatedStorage`. Anyone with the URL can post to your channel. The add-on redacts configured webhook URLs from every message it sends.
+</Warning>
+
+<Warning>
+  **Discord refuses requests from Roblox servers.** Discord answers requests from Roblox's datacenter ranges with HTTP 403. Route requests through a proxy that keeps Discord's path: replace the host and keep `/api/webhooks/<id>/<token>`. The community-run [WebhookProxy](https://github.com/lewisakura/webhook-proxy) is one option.
+
+  ```lua
+  Alerts = { Url = "https://<proxy host>/api/webhooks/<id>/<token>" },
+  ```
+</Warning>
+
+### What It Reports
+
+| Category | When it fires | Default |
+| --- | --- | --- |
+| `Health` | Profile-service degradation, outage, and recovery | On |
+| `Leaderboards` | A board becomes degraded or recovers | On |
+| `Issues` | `Error` and `Fatal` log entries | On |
+| `Warnings` | Selected `Warn` entries (configurable) | Selected codes |
+| `Performance` | A configured threshold is exceeded, or clears | Off until configured |
+| `Summaries` | Regular health, usage, and performance reports | Off |
+
+### Separate Channels
+
+Name a destination per channel and route categories to them:
+
+```lua
+ScribeTelemetry.Start(Scribe, {
+    Webhooks = {
+        Alerts = {
+            Url     = "https://<proxy>/api/webhooks/<id>/<token>",
+            Mention = { RoleId = "123456789012345678" }, -- pings on Fatal/Outage
+        },
+        Health   = { Url = "https://<proxy>/api/webhooks/<id>/<token>" },
+        Boards   = { Url = "https://<proxy>/api/webhooks/<id>/<token>" },
+        Summaries = { Url = "https://<proxy>/api/webhooks/<id>/<token>" },
+    },
+    Default = "Alerts",
+    Routes = {
+        Health       = "Health",
+        Leaderboards = "Boards",
+        Summaries    = "Summaries",
+        Performance  = { "Alerts", "Health" },
+        Warnings     = false,  -- disable this category entirely
+    },
+    Summaries = { Enabled = true, Interval = 1800 },
+    Performance = {
+        Rules = {
+            SlowSaves    = { Threshold = 2 },  -- p99 save duration in seconds
+            SaveFailures = { Threshold = 1 },  -- failures per minute
+        },
+    },
+})
+```
+
+### Handle Methods
+
+```lua
+local telemetry = ScribeTelemetry.Start(Scribe, options)
+
+telemetry:Test("Alerts")              -- queue one test message; returns (ok, reason)
+telemetry:Preview("Alerts", "Health") -- queue synthetic preview examples; returns (ok, reason)
+telemetry:Flush(5)                    -- wait up to 5 seconds for queues to drain
+telemetry:GetStats()                  -- read queue and delivery state, no URLs exposed
+telemetry:Stop()                      -- stop monitoring and remove listeners; idempotent
+```
+
+<Note>
+  The add-on sends nothing from Studio unless you add `AllowStudio = true` to the options. Use a separate test channel when previewing report designs.
+</Note>
+
+### Player Privacy
+
+Player identifiers are redacted by default. Context fields named `UserId`, `RecipientId`, `BuyerId`, `Player`, or anything ending in `UserId` or `PlayerId` become `[player]`. Profile keys with the player prefix also have their digits removed. Set `IncludePlayerIds = true` only if you explicitly want player IDs in reports sent to your endpoint.
+
+### roblox-ts
+
+```sh
+npm install @rbxts/scribe @rbxts/scribe-telemetry
+```
+
+```ts
+import Scribe from "@rbxts/scribe";
+import ScribeTelemetry from "@rbxts/scribe-telemetry";
+
+const telemetry = ScribeTelemetry.Start(Scribe, {
+    Webhooks: {
+        Alerts: { Url: "https://<proxy>/api/webhooks/<id>/<token>" },
+    },
+    Default: "Alerts",
+});
+```
+
+Destination names are inferred from `Webhooks`, so a misspelled route or `telemetry.Test(...)` destination is a type error at compile time.
+
+---
+
+## ScribeLeaderstats
+
+ScribeLeaderstats displays selected data fields in Roblox's built-in player list. It listens for changes through Scribe observers, never polls loaded profiles, and never makes DataStore requests. Scribe remains the source of truth; the add-on never saves data or writes leaderstat changes back into your profile.
+
+### Installing
+
+Copy `addons/leaderstats/ScribeLeaderstats.luau` into `ServerScriptService`. The core Wally package does not include it.
+
+### Configuring Columns
+
+```lua
+-- ServerScriptService/Leaderstats.server.luau
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local Data        = require(ReplicatedStorage.Shared.GameData).Server
+local Leaderstats = require(ServerScriptService.ScribeLeaderstats)
+
+local display = Leaderstats.Start(Data, {
+    Coins = "Coins",          -- column name = "Coins", reads Data.Coins
+    Level = "Progress.Level", -- column name = "Level", reads the nested field
+    Title = "Title",          -- column name = "Title"
+})
+```
+
+The left side is the visible column name; the right side is the dot-separated path in your template. The add-on creates each player's `leaderstats` folder after their profile loads and updates values automatically as they change.
+
+### Supported Value Types
+
+| Scribe value | Roblox instance |
+| --- | --- |
+| Finite number (including decimals) | `NumberValue` |
+| String | `StringValue` |
+| Boolean | `BoolValue` |
+
+<Warning>
+  **Every selected value becomes visible to every client.** A `ServerOnly` or `Session` wrapper does not hide a value you explicitly select here. Keep private moderation, anti-cheat, and account data out of this configuration.
+</Warning>
+
+### Lifecycle
+
+```lua
+-- Stop the add-on before stopping the bundle.
+display:Stop()
+Data.Stop()
+```
+
+`Stop` disconnects listeners immediately and removes the generated stat instances. It preserves existing `leaderstats` folders and any unrelated children. Calling it twice is safe.
+
+### roblox-ts
+
+```sh
+npm install @rbxts/scribe @rbxts/scribe-leaderstats
+```
+
+```ts
+import ScribeLeaderstats from "@rbxts/scribe-leaderstats";
+import { Data } from "shared/data";
+
+const display = ScribeLeaderstats.Start(Data.Server, {
+    Coins: "Coins",
+    Level: "Progress.Level",
+});
+
+// During teardown:
+display.Stop();
+```
+
+Path types are checked against your actual server schema — misspellings, containers, optional values, and `Big` values are rejected at compile time.
+
+---
+
+## UI Adapters
+
+Scribe client accessors already have the shape a reactive UI framework wants: a value you can read, and a subscription that fires when it changes. The UI adapter add-ons bridge that interface to Vide, React, and Fusion in five lines each.
+
+The adapters live in `addons/ui/`. Copy the file you want into your game, or insert `ScribeUIAdapters-Addon.rbxm` from the release page. Each adapter takes your framework as an argument, because it lives at a path in your project that Scribe cannot know.
+
+### ScribeVide
+
+```lua
+-- client/UI.client.luau
+local vide     = require(ReplicatedStorage.Packages.Vide)
+local useScribe = require(ReplicatedStorage.Shared.ScribeVide)(vide)
+local Data     = require(ReplicatedStorage.Shared.GameData).Client
+
+local function CoinLabel()
+    local coins, disconnect = useScribe(Data.Coins)
+    vide.cleanup(disconnect)
+    return vide.create("TextLabel")({
+        Text = function()
+            return `{coins()} coins`
+        end,
+    })
+end
+```
+
+`useScribe` returns a Vide source and a disconnect function. Call `vide.cleanup(disconnect)` to stop the Scribe listener when the component is destroyed.
+
+### ScribeReact
+
+```lua
+local React      = require(ReplicatedStorage.Packages.React)
+local ScribeReact = require(ReplicatedStorage.Shared.ScribeReact)(React)
+local Data       = require(ReplicatedStorage.Shared.GameData).Client
+
+local function CoinLabel()
+    local coins = ScribeReact.useScribe(Data.Coins)
+    return React.createElement("TextLabel", { Text = `{coins} coins` })
+end
+```
+
+`useScribe` re-renders the component on every change. When a value only feeds a property, `useScribeBinding` updates that property without re-rendering:
+
+```lua
+local coins = ScribeReact.useScribeBinding(Data.Coins)
+return React.createElement("TextLabel", {
+    Text = coins:map(function(c)
+        return `{c} coins`
+    end),
+})
+```
+
+<Note>
+  The React adapter targets jsdotlua 17.2.1 and uses `useState`, `useEffect`, and `useBinding`. It deliberately avoids `useSyncExternalStore`, which is a React 18 hook not present in the Roblox port.
+</Note>
+
+### ScribeFusion
+
+```lua
+local Fusion   = require(ReplicatedStorage.Packages.Fusion)
+local useScribe = require(ReplicatedStorage.Shared.ScribeFusion)(Fusion, scope)  -- 0.3, with scope
+-- Or:
+local useScribe = require(ReplicatedStorage.Shared.ScribeFusion)(Fusion)          -- 0.2, no scope
+
+local coins, disconnect = useScribe(Data.Coins)
+```
+
+On Fusion 0.3, the disconnect is registered in the scope automatically — `doCleanup(scope)` stops the Scribe listener along with everything else. On 0.2, call `disconnect()` yourself when the UI is destroyed.
+
+### Why the Adapters Are Reliable
+
+Three properties of the Scribe client mirror make these five-line adapters correct and stable:
+
+1. **`Get()` is referentially stable.** Two calls with no changes in between return the same table, so a React memo or Vide derived does not recompute spuriously.
+2. **That survives a resync.** A dropped frame causes the client to re-handshake. References are unchanged across that when values are unchanged.
+3. **One frame of writes is one notification.** Three `Increment` calls inside a `Data.Batch` reach the client as a single `Changed`. No adapter needs to debounce.
+
+<Note>
+  The Vide and Fusion adapters subscribe with `Observe`, not `Changed`. `Observe` delivers the current value before it returns, closing the gap between reading the initial value and subscribing to later ones. The React adapter re-reads with `Get()` at the top of its effect instead, which closes the same gap differently.
+</Note>
+
+### roblox-ts
+
+Install only the adapter and framework you use:
+
+```sh
+npm install @rbxts/scribe-react @rbxts/react
+# or
+npm install @rbxts/scribe-vide @rbxts/vide
+# or
+npm install @rbxts/scribe-fusion @rbxts/fusion
+```
+
+```ts
+import React from "@rbxts/react";
+import ScribeReact from "@rbxts/scribe-react";
+import { Data } from "shared/data";
+
+const { useScribe, useScribeBinding } = ScribeReact(React);
+
+function CoinLabel() {
+    const coins = useScribe(Data.Client.Coins); // number, fully typed
+    return React.createElement("TextLabel", { Text: `${coins} coins` });
+}
+```
+
+Each adapter preserves the accessor's value type in TypeScript, including `undefined` for an absent dictionary entry.
+
+### What UI Adapters Cannot Do
+
+Another player's `Scribe.Shared` roots have no accessor and cannot go through these adapters. Use `Data.GetShared` and `Data.OnSharedChanged` instead:
+
+```lua
+Data.OnSharedChanged:Connect(function(userId, sharedData)
+    local pets = sharedData and sharedData.EquippedPets
+    -- sharedData is nil when that player leaves
+end)
+```
+
+`Data.GetShared(localPlayer)` is always `nil` — the server broadcasts a player's Shared data to everyone except that player. Read your own fields through the ordinary accessor, which the adapters handle.
+
+<CardGroup cols={2}>
+  <Card title="Diagnostics" icon="chart-line" href="/guides/diagnostics">
+    The log sink and metric APIs that ScribeTelemetry builds on.
+  </Card>
+  <Card title="Replication" icon="arrows-rotate" href="/guides/replication">
+    Visibility rules that determine what clients can read.
+  </Card>
+  <Card title="Values" icon="pen-to-square" href="/guides/values">
+    Get, Changed, Observe, and Batch — the accessor methods adapters use.
+  </Card>
+  <Card title="roblox-ts" icon="code" href="/guides/roblox-ts">
+    Full roblox-ts setup including all add-on npm packages.
+  </Card>
+</CardGroup>

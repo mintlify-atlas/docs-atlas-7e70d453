@@ -1,0 +1,577 @@
+---
+title: "Scribe Type Reference: Options, Results, and Events"
+sidebarTitle: "Types"
+description: "All exported Scribe types: setup, session, monetization, leaderboards, exchanges, gifting, diagnostics, requests, and transport."
+---
+
+This page documents every named type exported from the Scribe module. Types are used in function signatures throughout the [Server](/api/server), [Client](/api/client), and [Value](/api/value) APIs. Where a type appears in a `<ParamField>` or `<ResponseField>` on another page, you can look up its exact shape here.
+
+---
+
+## Setup Types
+
+### `Bundle<T, S>`
+
+The object returned by calling `Scribe(options)`. Contains the two halves of your data system.
+
+<ResponseField name="Server" type="Server<T, S>">
+  The server-side API. Use from `Script`s. See the [Server API reference](/api/server).
+</ResponseField>
+<ResponseField name="Client" type="Client<T, S>">
+  The client-side API. Use from `LocalScript`s. See the [Client API reference](/api/client).
+</ResponseField>
+
+---
+
+### `ScribeOptions<T, S>`
+
+The full configuration table passed to `Scribe(options)`. Only three fields are required.
+
+<ResponseField name="Template" type="T" required>
+  Your data shape, built from plain values and Scribe declarators.
+</ResponseField>
+<ResponseField name="ProfileStoreIndex" type="string" required>
+  The DataStore name. Each game must use its own unique name.
+</ResponseField>
+<ResponseField name="ProfileKeyPrefix" type="string" required>
+  Per-player key prefix such as `"PLAYER_"`. Pass `""` for bare user-id keys.
+</ResponseField>
+<ResponseField name="ServerStore" type="S?">
+  Server-owned state replicated to all clients but not tied to any player profile.
+</ResponseField>
+<ResponseField name="Mode" type='"Live" | "Mock" | "NoSave"?'>
+  Persistence mode. Default `"Live"`. `"Mock"` runs in-memory; `"NoSave"` loads but never saves.
+</ResponseField>
+<ResponseField name="SaveInterval" type="number?">
+  Seconds between autosaves per profile. Default `300`, floor `15`.
+</ResponseField>
+<ResponseField name="Transport" type="ScribeTransport | string?">
+  Custom transport, or `"Default"` for the built-in `RemoteEvent` channel.
+</ResponseField>
+<ResponseField name="Leaderboards" type="{ [string]: LeaderboardConfig }?">
+  Named leaderboard configurations.
+</ResponseField>
+<ResponseField name="Products" type="{ [string]: ProductConfig }?">
+  Declared Roblox developer products, keyed by name.
+</ResponseField>
+<ResponseField name="Passes" type="{ [string]: PassConfig }?">
+  Declared Roblox game passes, keyed by name.
+</ResponseField>
+<ResponseField name="Exchangeable" type="{ [string]: ExchangeableSpec }?">
+  Allowlist of paths and kinds the exchange system may move.
+</ResponseField>
+<ResponseField name="Migrations" type="{ [number]: (data, migration: MigrationContext) -> () }?">
+  Versioned migration callbacks applied in order when loading an older profile.
+</ResponseField>
+<ResponseField name="OnPlayerInit" type="(player: Player, data: ValueType<T>) -> ()?">
+  Runs once per new profile, after migration but before replication.
+</ResponseField>
+<ResponseField name="Gifting" type="{ ... }?">
+  Gift cooldowns, TTLs, and delivery policy. See the [Gifting guide](/guides/gifting).
+</ResponseField>
+<ResponseField name="PurchaseLog" type="{ ReplicateRobux: boolean?, MaxRobuxEntries: number?, MaxInGameEntries: number?, PurchaseLogCategories: { string }? }?">
+  Controls purchase history retention and client replication.
+</ResponseField>
+<ResponseField name="DevMode" type="boolean?">
+  Overrides `RunService:IsStudio()`; enables collision checks and verbose warnings.
+</ResponseField>
+
+---
+
+### `MigrationContext`
+
+Passed to each migration callback and to `ImportLegacyData`. Provides the budget-aware save primitive.
+
+<ResponseField name="AwaitBudget" type="(requestType: string) -> ()">
+  Yields until a DataStore budget token is available for `requestType`. Use inside migration callbacks that need to make additional DataStore calls.
+</ResponseField>
+
+---
+
+## Session Types
+
+### `SessionState`
+
+The three states a player's profile moves through during its lifetime.
+
+| Value | Meaning |
+|---|---|
+| `"Loading"` | The profile is being acquired from the DataStore. |
+| `"Ready"` | The profile is loaded and the accessor tree is available. |
+| `"SessionEnded"` | The session has ended (player left, shutdown, or error). |
+
+---
+
+### `LoadPhase`
+
+The sub-stage within `"Loading"`, returned as the second value from `Server.GetState`.
+
+| Value | Meaning |
+|---|---|
+| `"WaitingForErase"` | A pending erase for this user is blocking the join. |
+| `"AcquiringSession"` | Waiting for a previous server's session lock to release. |
+| `"ReadingProfile"` | Reading the profile data from the DataStore. |
+| `"Retrying"` | A DataStore call failed and is being retried. |
+| `"Initializing"` | Applying migrations and calling `OnPlayerInit`. |
+| `"Importing"` | Running `ImportLegacyData` to bring in data from a legacy store. |
+| `"ImportThrottled"` | The import is waiting on the DataStore request budget. |
+
+---
+
+### `LifecycleReason`
+
+Why a data session ended, or why waiting for data did not produce a tree. The second return from `Server.WaitForData` and the argument to `Server.SessionEnded`.
+
+| Value | Meaning | Retryable |
+|---|---|---|
+| `"load-failed"` | The profile could not be loaded (DataStore failure or session not acquirable). | No |
+| `"migration-failed"` | A migration step errored; the profile was released unmigrated. | No |
+| `"erasing"` | This player's profile is being erased; joining is refused until complete. | After erase |
+| `"session-ended"` | The session ended while the player was still in game (usually stolen). | No |
+| `"player-left"` | The player left. The most common reason. | No |
+| `"shutdown"` | The server is closing. | No |
+| `"still-loading"` | The wait elapsed while the load was still in flight. Nothing has failed. | Yes |
+| `"timeout"` | The wait elapsed and Scribe has no session for this player at all. | No |
+
+Named constants are available as `Scribe.Reason` (alias `Scribe.LifecycleReason`). See the [Scribe module reference](/api/scribe#named-constant-tables).
+
+---
+
+### `SaveInfo`
+
+The player's current save state, returned by `Server.GetSaveInfo` and `Client.GetSaveInfo`.
+
+<ResponseField name="Dirty" type="boolean">
+  Whether there are unsaved changes.
+</ResponseField>
+<ResponseField name="LastSaveAt" type="number?">
+  Unix timestamp of the last successful save. `nil` before the first save.
+</ResponseField>
+<ResponseField name="LastResult" type='"Ok" | "Fail"?'>
+  Whether the last save attempt succeeded.
+</ResponseField>
+<ResponseField name="Size" type="number?">
+  Approximate byte size of the last successful save. `nil` before the first save.
+</ResponseField>
+
+---
+
+## Monetization Types
+
+### `ProductConfig`
+
+Configuration for a Roblox developer product declared in `ScribeOptions.Products`.
+
+<ResponseField name="Id" type="number" required>The Roblox product asset ID.</ResponseField>
+<ResponseField name="Category" type="string?">Grouping label for purchase logs and `PurchaseFilter`.</ResponseField>
+<ResponseField name="Grant" type="((data: any) -> ())?">Callback that applies the grant when the receipt is processed.</ResponseField>
+<ResponseField name="Grants" type="string?">Name of a perk to grant automatically, as an alternative to a `Grant` callback.</ResponseField>
+<ResponseField name="PaidRandom" type="boolean?">Mark this as a paid random item. Refused for accounts with restrictions.</ResponseField>
+
+---
+
+### `PassConfig`
+
+Configuration for a Roblox game pass declared in `ScribeOptions.Passes`.
+
+<ResponseField name="Id" type="number" required>The Roblox game pass asset ID.</ResponseField>
+<ResponseField name="Category" type="string?">Grouping label for purchase logs.</ResponseField>
+
+---
+
+### `PurchaseSpec`
+
+The argument to `Server.Purchase` for soft-currency transactions.
+
+<ResponseField name="Cost" type="{ Path: string, Amount: number }" required>
+  `Path` is a dot-joined path to a spendable number field (e.g. `"Coins"`). `Amount` is the price.
+</ResponseField>
+<ResponseField name="ItemId" type="string" required>A unique identifier for this item, used in purchase logs.</ResponseField>
+<ResponseField name="Category" type="string?">Grouping label.</ResponseField>
+<ResponseField name="Grant" type="((data: any) -> ())?">Applied after the debit if provided.</ResponseField>
+<ResponseField name="Meta" type="{ [string]: any }?">Arbitrary metadata stored in the purchase log.</ResponseField>
+<ResponseField name="IdempotencyKey" type="string?">
+  Two calls with the same key apply once. Max 64 bytes, valid UTF-8. A failed purchase claims nothing, so retrying after a refusal still works.
+</ResponseField>
+<ResponseField name="PaidRandom" type="boolean?">Mark as a paid random item.</ResponseField>
+
+---
+
+### `PurchaseFilter`
+
+Filter for `Server.GetPurchases` and `Client.GetPurchases`.
+
+<ResponseField name="Kind" type='"Robux" | "InGame"?'>Filter by purchase kind.</ResponseField>
+<ResponseField name="Category" type="string?">Filter by category.</ResponseField>
+<ResponseField name="ItemId" type="string?">Filter by item ID.</ResponseField>
+<ResponseField name="Since" type="number?">Unix timestamp lower bound.</ResponseField>
+<ResponseField name="Limit" type="number?">Maximum entries to return.</ResponseField>
+
+---
+
+### `PurchaseReason`
+
+Why `Server.Purchase` refused. The second return on failure.
+
+| Value | Meaning |
+|---|---|
+| `"player data not loaded"` | The player's profile is not Ready. |
+| `"invalid Cost spec"` | The `Cost` table is malformed. |
+| `"invalid Cost amount"` | The amount is zero, negative, or non-finite. |
+| `"invalid cost path"` | The dot-joined path does not resolve to a field. |
+| `"cost path is not a spendable number"` | The field exists but is not a plain integer or float. |
+| `"insufficient funds"` | The player does not have enough. |
+| `"paid random items are not available for this account"` | Account restriction. |
+| `"cannot check account settings right now; try again in a moment"` | Policy pending. |
+
+Named constants are on `Scribe.PurchaseReason`.
+
+---
+
+### `ProductState`
+
+The current state of a declared product or pass for one player. Returned by `Server.GetProductState` and `Client.GetProductState`.
+
+| Value | Meaning |
+|---|---|
+| `"purchasable"` | The player can purchase this item. |
+| `"owned"` | The player already owns it (pass or perk). |
+| `"paid-random-restricted"` | Account restrictions block paid random items. |
+| `"policy-pending"` | The policy check has not completed yet. |
+| `"not-loaded"` | The player's data is not loaded. |
+
+Named constants are on `Scribe.ProductState`.
+
+---
+
+## Leaderboard Types
+
+### `LeaderboardConfig`
+
+Configuration for one board declared in `ScribeOptions.Leaderboards`.
+
+<ResponseField name="Stat" type="string" required>Dot-joined path to a numeric field. Must resolve to a number or `Scribe.Big` leaf.</ResponseField>
+<ResponseField name="Limit" type="number?">Maximum entries to fetch. Default varies by scope.</ResponseField>
+<ResponseField name="Scale" type="number?">Multiplier applied to raw scores when writing to the OrderedDataStore. Incompatible with `Scribe.Big` stats.</ResponseField>
+<ResponseField name="SigFigs" type="number?">For `Scribe.Big` stats only: significant figures for the ranking key (1–15, default 12).</ResponseField>
+<ResponseField name="Replicate" type="boolean?">Default `false` (server-only). `true` streams the board to clients.</ResponseField>
+<ResponseField name="Period" type='"Daily" | "Weekly"?'>A resetting board. `nil` is lifetime.</ResponseField>
+<ResponseField name="Mode" type='"Gain" | "Peak"?'>With `Period`: rank the gain since reset (`"Gain"`, default) or the peak seen in the period (`"Peak"`).</ResponseField>
+<ResponseField name="Scope" type='"Global" | "Server"?'>
+  `"Server"` ranks players on this server only, with no store. `"Global"` (default) uses OrderedDataStore.
+</ResponseField>
+<ResponseField name="RefreshInterval" type="number?">Approximate seconds between store reads. Default `60`, floor `60`.</ResponseField>
+<ResponseField name="WriteInterval" type="number?">Minimum seconds between per-player score writes. Default `30`, minimum `1`.</ResponseField>
+
+---
+
+### `LeaderboardEntry`
+
+One row in a leaderboard result list.
+
+<ResponseField name="Rank" type="number">Position, starting at 1.</ResponseField>
+<ResponseField name="UserId" type="number">The player's UserId.</ResponseField>
+<ResponseField name="Name" type="string">The player's display name at the time of the score write.</ResponseField>
+<ResponseField name="Score" type="number | BigScore">
+  A plain number for normal boards; a [`BigValue`](#bigvalue) for boards tracking a `Scribe.Big` stat.
+</ResponseField>
+
+---
+
+### `LeaderboardStatus`
+
+The health of one leaderboard board.
+
+| Value | Meaning |
+|---|---|
+| `"Starting"` | The board has not yet completed its first read. |
+| `"Healthy"` | Reads and writes are succeeding. |
+| `"Degraded"` | Recent errors have been logged but the board is still operating. |
+
+---
+
+### `LeaderboardStatusInfo`
+
+Detailed health returned by `Server.GetLeaderboardStatus`.
+
+<ResponseField name="Status" type="LeaderboardStatus"></ResponseField>
+<ResponseField name="PendingWrites" type="number">Score writes queued and not yet committed.</ResponseField>
+<ResponseField name="RetryingWrites" type="number">Writes currently being retried after an error.</ResponseField>
+<ResponseField name="RejectedWrites" type="number">Writes that were permanently dropped.</ResponseField>
+<ResponseField name="LastReadAt" type="number?">Unix timestamp of the last successful board read.</ResponseField>
+<ResponseField name="ReadAge" type="number?">Seconds since the last read.</ResponseField>
+<ResponseField name="LastWriteAt" type="number?">Unix timestamp of the last successful score write.</ResponseField>
+<ResponseField name="LastReadError" type="string?">The most recent read error message.</ResponseField>
+<ResponseField name="LastWriteError" type="string?">The most recent write error message.</ResponseField>
+
+---
+
+## Exchange Types
+
+### `ExchangeableSpec`
+
+One entry in the `Exchangeable` allowlist declared in `ScribeOptions`. Every path the exchange system may touch must be listed here.
+
+<ResponseField name="Path" type="{ string }" required>The path segments identifying the container (e.g. `{ "Inventory" }`).</ResponseField>
+<ResponseField name="Kind" type='"Key" | "Qty" | "Stack"' required>
+  Which exchange kind is permitted at this path.
+</ResponseField>
+<ResponseField name="Count" type="string?">For `"Stack"` kind: dot-joined path to the quantity field within the entry.</ResponseField>
+<ResponseField name="Identity" type="{ string }?">Fields that identify a `"Stack"` entry for matching purposes.</ResponseField>
+<ResponseField name="Ignore" type="{ string }?">Fields to ignore during `"Stack"` identity comparison.</ResponseField>
+
+---
+
+### `ExchangeLeg`
+
+One item in a basket passed to `Server.Exchange.Attempt`.
+
+<ResponseField name="Path" type="{ string }" required>Container path, matching an `ExchangeableSpec`.</ResponseField>
+<ResponseField name="Kind" type='"Key" | "Qty" | "Stack"' required>The exchange kind for this leg.</ResponseField>
+<ResponseField name="Key" type="string?">For `"Key"` and `"Stack"` kinds: the container key.</ResponseField>
+<ResponseField name="Amount" type="number?">For `"Qty"` and `"Stack"` kinds: the quantity to move.</ResponseField>
+
+---
+
+### `OpenExchange`
+
+One in-flight exchange record returned by `Server.Exchange.Open`.
+
+<ResponseField name="Id" type="string">The exchange identifier.</ResponseField>
+<ResponseField name="State" type='"Claimed" | "Staked" | "Delivering"'>Current stage.</ResponseField>
+<ResponseField name="Partner" type="number">The other player's UserId.</ResponseField>
+<ResponseField name="Staked" type="{ ExchangeLeg }">What this player gave (held in escrow).</ResponseField>
+<ResponseField name="Owed" type="{ ExchangeLeg }">What this player is owed.</ResponseField>
+<ResponseField name="Since" type="number">Unix timestamp when the exchange began.</ResponseField>
+
+---
+
+## Gifting Types
+
+### `GiftReason`
+
+Why `Server.PromptGift` refused. The second return on failure.
+
+| Value | Meaning |
+|---|---|
+| `"buyer data not loaded"` | Buyer's profile is not Ready. |
+| `"invalid recipient"` | The recipient UserId is not valid. |
+| `"cannot gift yourself"` | Buyer and recipient are the same user. |
+| `"gift cooldown"` | The buyer is on a gifting cooldown. |
+| `"product retired"` | The product is in `RetiredProducts`. |
+| `"too many pending gifts"` | The recipient has too many undelivered gifts. |
+| `"data services are experiencing issues; try again later"` | Service health is Outage. |
+| `"recipient already owns this"` | The recipient already owns the product. |
+| `"could not reserve gift credit; try again later"` | Credit reservation failed. |
+| `"could not deliver gift; try again later"` | Delivery failed; credit is back. |
+| `"gift delivery could not be confirmed; do not send it again"` | Write may have committed but the answer was lost. |
+| `"a gift of this item is already pending; try again shortly"` | Deduplication window is active. |
+| `"could not record gift intent; try again later"` | Intent write failed. |
+| `"paid random items are not available for this account"` | Account restriction. |
+| `"cannot check account settings right now; try again in a moment"` | Policy pending. |
+
+<Warning>
+  Never collapse `"could not deliver gift; try again later"` and `"gift delivery could not be confirmed; do not send it again"` in a UI. The first means no gift was sent and the credit is back. The second means the write may have committed; retrying would send a duplicate the recipient's deduplication cannot catch.
+</Warning>
+
+---
+
+## Diagnostics Types
+
+### `Status`
+
+Scribe's view of whether DataStores are answering, derived from ProfileStore error signals with hysteresis.
+
+| Value | Meaning |
+|---|---|
+| `"Healthy"` | DataStore calls are succeeding. |
+| `"Degraded"` | Elevated error rates; saves may be delayed. |
+| `"Outage"` | DataStore calls are failing consistently. |
+
+---
+
+### `LogEntry`
+
+One record from `Scribe.GetRecentLogs`, and the single argument passed to every sink registered with `Scribe.AddLogSink`.
+
+<ResponseField name="At" type="number">Unix timestamp.</ResponseField>
+<ResponseField name="Level" type="LogLevel">Severity.</ResponseField>
+<ResponseField name="Category" type="LogCategory">Subsystem.</ResponseField>
+<ResponseField name="Code" type="LogCode">Machine-readable code. Branch on `Code`, not on `Message`.</ResponseField>
+<ResponseField name="Message" type="string">Human-readable description.</ResponseField>
+<ResponseField name="Context" type="{ [string]: any }?">Structured data for the entry, keyed by field name.</ResponseField>
+
+---
+
+### `LogLevel`
+
+Severity of a log entry, from lowest to highest.
+
+| Value | Use |
+|---|---|
+| `"Debug"` | Verbose tracing, off by default. |
+| `"Info"` | Normal operational events. |
+| `"Warn"` | Unexpected but recoverable conditions. |
+| `"Error"` | Errors that affect one player or operation. |
+| `"Fatal"` | Errors that affect the whole server. |
+
+---
+
+### `LogCategory`
+
+Which subsystem emitted a log entry. Useful for filtering sinks to one area.
+
+| Value | Subsystem |
+|---|---|
+| `"Persistence"` | DataStore reads, saves, migrations, offline operations. |
+| `"Replication"` | Wire protocol, fragmentation, diffs. |
+| `"Transport"` | Frame delivery and rate limiting. |
+| `"Commands"` | Command registration, dispatch, and rate limiting. |
+| `"Leaderboards"` | Board reads, writes, resets. |
+| `"Monetization"` | Receipts, grants, product state, perks. |
+| `"Gifting"` | Gift credits, delivery, deduplication. |
+| `"Integrity"` | Anomaly detection, wipe guard, schema violations. |
+| `"Lifecycle"` | Bundle startup, shutdown, session state. |
+| `"Derived"` | Derived field computation and mismatches. |
+| `"Exchanges"` | Exchange attempt, staking, delivery. |
+
+---
+
+### `BudgetSnapshot`
+
+Returned by `Scribe.GetBudgetSnapshot`.
+
+<ResponseField name="Available" type="boolean">
+  `false` when the engine could not be queried (e.g. Studio with API access off). Treat as no opinion, not as zero allowance.
+</ResponseField>
+<ResponseField name="Budgets" type="{ [string]: number }">
+  Current request counts by type, e.g. `{ UpdateAsync = 60, GetAsync = 60 }`.
+</ResponseField>
+<ResponseField name="At" type="number">Unix timestamp when the snapshot was taken.</ResponseField>
+
+---
+
+## Request Types
+
+### `RequestReason`
+
+Why Scribe answered a `Client.Request` with a refusal. The second return when the third return is `Scribe.RequestFailed`.
+
+| Value | Meaning |
+|---|---|
+| `"rate-limited"` | Over `CommandRateLimit`; the handler never ran. |
+| `"not-ready"` | The caller's profile is not Ready. |
+| `"unknown-command"` | Nothing is registered under that name. |
+| `"bad-args"` | Arity or `Args`-spec mismatch. |
+| `"bad-idempotency-key"` | Key sent to a non-idempotent command, or omitted from an idempotent one. |
+| `"error"` | The handler threw; the traceback goes to `COMMAND_ERROR`, not the client. |
+| `"reply-encode-failed"` | The handler succeeded but its return value could not be encoded. |
+| `"timeout"` | Client-side: no reply within `RequestTimeout`. |
+| `"send-failed"` | Client-side: the transport raised while sending. |
+| `"edit-mode"` | Client-side: not running, and no `MockCommand` is registered. |
+| `"mock-error"` | Client-side: edit mode, and the `MockCommand` handler threw. |
+
+Named constants are on `Scribe.RequestReason`.
+
+<Note>
+  A handler may return `false, "timeout"` of its own. Always test the third return value against `Scribe.RequestFailed` to distinguish a framework refusal from a handler message.
+</Note>
+
+---
+
+## Value Types
+
+### `BigValue`
+
+The object returned by `Get()` on a `Scribe.Big` field. Supports full arithmetic, comparison, and display.
+
+<ResponseField name="M" type="number">Mantissa of the internal representation.</ResponseField>
+<ResponseField name="E" type="number">Exponent of the internal representation.</ResponseField>
+<ResponseField name="Short" type="(self, decimals?: number) -> string">Formats as `"1.5K"`, `"100M"`, etc.</ResponseField>
+<ResponseField name="ToNumber" type="(self) -> number">Converts to a plain Lua number (may lose precision).</ResponseField>
+<ResponseField name="Log10" type="(self) -> number">Returns the base-10 logarithm.</ResponseField>
+<ResponseField name="Add" type="(self, other: BigValue | number | string) -> BigValue"></ResponseField>
+<ResponseField name="Subtract" type="(self, other: BigValue | number | string) -> BigValue"></ResponseField>
+<ResponseField name="Multiply" type="(self, other: BigValue | number | string) -> BigValue"></ResponseField>
+<ResponseField name="Divide" type="(self, other: BigValue | number | string) -> BigValue"></ResponseField>
+<ResponseField name="Pow" type="(self, exp: number) -> BigValue"></ResponseField>
+<ResponseField name="Negate" type="(self) -> BigValue"></ResponseField>
+<ResponseField name="Compare" type="(self, other: BigValue | number | string) -> number">Returns negative, zero, or positive.</ResponseField>
+<ResponseField name="Equals" type="(self, other: BigValue | number | string) -> boolean"></ResponseField>
+
+Arithmetic operators `+`, `-`, `*`, `/`, unary `-`, and comparisons `<`, `<=`, `==` are also supported via metamethods on any `BigValue | number | string` operand pair.
+
+---
+
+### `EconomyMeta`
+
+The optional tag passed to `Value.Increment` and `Value.Decrement` to auto-emit a `LogEconomyEvent`.
+
+<ResponseField name="Flow" type='"Source" | "Sink"?'>Default: `Increment` → `Source`, `Decrement` → `Sink`.</ResponseField>
+<ResponseField name="TransactionType" type="Enum.AnalyticsEconomyTransactionType | string?">Default `"Gameplay"`.</ResponseField>
+<ResponseField name="ItemSku" type="string?">The item the currency was spent on or gained from.</ResponseField>
+<ResponseField name="Currency" type="string?">Override the logged currency label. Default: the field name.</ResponseField>
+<ResponseField name="Fields" type="{ [string]: any }?">Per-event custom-field values keyed by declared field name.</ResponseField>
+
+---
+
+## Transport Type
+
+### `ScribeTransport`
+
+The interface for a custom transport adapter passed to `ScribeOptions.Transport`. Implement the server-side and client-side halves on one object.
+
+<ResponseField name="Name" type="string" required>Human-readable name for logging and diagnostics.</ResponseField>
+<ResponseField name="MaxFrameBytes" type="number?">
+  The largest buffer this channel wants handed to it in one call. Read once at construction; wins over `MaxOutboundBytes` only when smaller, so it can never raise a game's configured budget.
+</ResponseField>
+
+**Server-side (required on the server):**
+
+<ResponseField name="SendToClient" type="(self, player: Player, bytes: buffer) -> ()" required>
+  Send a buffer to one client.
+</ResponseField>
+<ResponseField name="SendToAllClients" type="((self, bytes: buffer) -> ())?">
+  Broadcast to all clients. Optional; Scribe falls back to per-player sends if absent.
+</ResponseField>
+<ResponseField name="ListenServer" type="(self, callback: (player: Player, bytes: buffer) -> ()) -> ()" required>
+  Register the inbound callback. Called once at bundle construction.
+</ResponseField>
+
+**Client-side (required in a LocalScript):**
+
+<ResponseField name="SendToServer" type="(self, bytes: buffer) -> ()" required>
+  Send a buffer to the server.
+</ResponseField>
+<ResponseField name="ListenClient" type="(self, callback: (bytes: buffer) -> ()) -> ()" required>
+  Register the inbound callback. Called once at bundle construction.
+</ResponseField>
+<ResponseField name="Release" type="((self) -> ())?">
+  Called by `Client.Stop` to disconnect what `ListenClient` connected.
+</ResponseField>
+
+```lua
+-- Minimal custom transport skeleton
+local MyTransport = {}
+MyTransport.__index = MyTransport
+
+function MyTransport.new()
+    return setmetatable({ Name = "MyTransport" }, MyTransport)
+end
+
+function MyTransport:SendToClient(player, bytes)
+    MyRemote:FireClient(player, bytes)
+end
+
+function MyTransport:ListenServer(callback)
+    MyRemote.OnServerEvent:Connect(callback)
+end
+
+function MyTransport:SendToServer(bytes)
+    MyRemote:FireServer(bytes)
+end
+
+function MyTransport:ListenClient(callback)
+    MyRemote.OnClientEvent:Connect(callback)
+end
+```

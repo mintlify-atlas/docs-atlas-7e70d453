@@ -1,0 +1,287 @@
+---
+title: "Security Hardening and Data Integrity in Scribe"
+sidebarTitle: "Security"
+description: "Understand Scribe's built-in trust model, configure WipeGuard, BoundsPolicy, and rate limits, and protect your game from client abuse and data loss."
+---
+
+Scribe draws a hard line between what a player's client may say and what your server decides. This guide covers where that line sits, what Scribe checks before your code ever runs, and which decisions remain yours. Read it before you ship anything a player can spend money on.
+
+## The Trust Model
+
+**A client cannot write player data.** This is not a validation layer — there is no wire frame for it. A client emits exactly two frame types, `Hello` and `Command`, and the server's inbound dispatcher errors on anything else. No amount of crafted traffic can say "set my Coins to 999", because the wire has no way to express it.
+
+The safe shape for any feature that modifies player data is: a client asks (via a Command), and the server decides.
+
+```lua
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Scribe = require(ReplicatedStorage.Packages.Scribe)
+local Data = require(ReplicatedStorage.Shared.GameData).Server
+
+Data.Command("BuyPotion", {
+    Args = { Scribe.Int(1, { Min = 1, Max = 10 }) },
+}, function(player, count)
+    return Data.Purchase(player, {
+        Cost   = { Path = "Coins", Amount = 50 * count },
+        Category = "Consumable",
+        ItemId = "HealthPotion",
+        Grant  = function(data)
+            data.Inventory["HealthPotion"].Update(function(entry)
+                return { Qty = if entry then entry.Qty + count else count, Rarity = "Common" }
+            end)
+        end,
+    })
+end)
+```
+
+Two distinct checks are happening here. `Scribe.Int(1, { Min = 1, Max = 10 })` proves the **shape** of what arrived — an integer between 1 and 10 — before your handler runs. Your handler then proves the **entitlement**: `Data.Purchase` refuses if the player cannot afford it, and rolls the entire thing back if the grant throws. Scribe can only do the former.
+
+<Warning>
+Gate grants on the **server**, never on the client mirror. `Owns` on the client reads a replicated mirror that an exploiter can make return `true` locally. Use the server's `OwnsAsync`, which verifies live:
+
+```lua
+-- Server only. This is the one that decides.
+if Data.OwnsAsync(player, "VIP") then
+    Data[player].Gems.Increment(100)
+end
+```
+</Warning>
+
+## The Inbound Gauntlet
+
+Every frame from a client passes the same gates before Scribe looks at its contents. Cheaper checks run first.
+
+| Guard | Default | What it stops |
+| --- | --- | --- |
+| Session check | n/a | Frames from a player with no active profile are dropped |
+| Malformed budget | 32 per session | Past it, all inbound from that player is dropped unparsed |
+| Oversize budget | 32 per session | Its own counter and block, separate from the malformed budget |
+| `MaxInboundFrameRate` | `max(60, CommandRateLimit × 4)` | Raw frames per second per player |
+| `MaxInboundBytes` | 8192 | Frame size, checked before decode |
+| `MaxInboundRetainedBytes` | `MaxInboundBytes × 16` | How many bytes one frame may retain (size alone is a poor proxy) |
+| Command-name length | longest registered name, minimum 64 | An over-long name |
+| Wire recursion cap | 24 | Crafted deeply nested payloads |
+| Protocol version | n/a | Fails closed on version mismatch |
+| Schema hash | n/a | Fails closed on template drift |
+| Re-`Hello` cooldown | 5s | Repeated handshakes forcing full snapshot encodes |
+
+<Accordion title="Why the retained-bytes ceiling is separate from frame size">
+Size is a poor proxy for cost. One byte can buy an array slot holding a boolean, while eight kilobytes of one string buys one header plus its payload. `MaxInboundRetainedBytes` is the ceiling that sees the difference.
+</Accordion>
+
+<Accordion title="Why an over-budget frame does not cost a player their session">
+An oversize-budget refusal is counted separately and never blocks the session. Unlike a malformed frame, an oversize one may simply be a legitimate payload with more elements than the default allows. A frame-rate trip sends no reply, because replying is the amplification it exists to avoid.
+</Accordion>
+
+## WipeGuard
+
+WipeGuard detects when a save would discard more than a configured ratio of the profile's data compared to the last good save. A collapse in top-level key count or payload size fires `WIPE_GUARD_TRIPPED` and the `OnAnomaly` signal.
+
+```lua
+Scribe({
+    Template = template,
+    ProfileStoreIndex = "PlayerData",
+    ProfileKeyPrefix  = "PLAYER_",
+
+    WipeGuardPolicy      = "Block",   -- "Warn" (default) or "Block"
+    WipeGuardShrinkRatio = 0.5,       -- trip if the payload shrinks by more than 50%
+})
+```
+
+<Tabs>
+  <Tab title="Warn (default)">
+    The trip is logged and `OnAnomaly` fires, but the save goes through. Use this when a legitimate reset is possible.
+  </Tab>
+  <Tab title="Block">
+    The last good snapshot persists instead. The save will not go through until you explicitly push the live data with `Data.Flush(player, { Force = true })`.
+  </Tab>
+</Tabs>
+
+## BoundsPolicy
+
+Scribe validates every write against the declared template. For numeric fields with declared bounds, the `BoundsPolicy` option controls what happens when a write is out of range.
+
+```lua
+Scribe({
+    Template = template,
+    ProfileStoreIndex = "PlayerData",
+    ProfileKeyPrefix  = "PLAYER_",
+
+    BoundsPolicy = "Reject",  -- "Clamp" (default) or "Reject"
+})
+```
+
+| Value | Behaviour |
+| --- | --- |
+| `"Clamp"` | Out-of-range values are silently clamped to the nearest bound. |
+| `"Reject"` | Out-of-range writes throw. Use this when a bad write is a bug you want to catch immediately. |
+
+## SchemaPolicy
+
+When Scribe loads a profile, it can validate the stored data against your current template. This catches profiles saved by an older or mismatched build.
+
+```lua
+Scribe({
+    Template = template,
+    ProfileStoreIndex = "PlayerData",
+    ProfileKeyPrefix  = "PLAYER_",
+
+    SchemaPolicy = "Warn",   -- absent (off), "Warn", or "Reject"
+})
+```
+
+| Value | Behaviour |
+| --- | --- |
+| absent | No check at load time. |
+| `"Warn"` | A violation is logged but the profile loads normally. |
+| `"Reject"` | A violation prevents the profile from loading; the session fails closed. |
+
+## VersionAheadPolicy
+
+If a profile was last saved by a newer version of your game than is running now, Scribe can either kick the player or allow the load.
+
+```lua
+Scribe({
+    Template = template,
+    ProfileStoreIndex = "PlayerData",
+    ProfileKeyPrefix  = "PLAYER_",
+
+    VersionAheadPolicy = "Kick",  -- "Kick" (default) or "Allow"
+})
+```
+
+`"Kick"` is the safe default — loading data saved by a newer build risks silently dropping fields the old template does not know about. `"Allow"` is useful during rolling deploys where you know the schemas are compatible.
+
+## Command Rate Limiting
+
+Commands are rate-limited per player as a token bucket. Past a sustained flood of 256 rejections without a ten-second quiet gap, even the rejection reply stops.
+
+```lua
+Scribe({
+    Template = template,
+    ProfileStoreIndex = "PlayerData",
+    ProfileKeyPrefix  = "PLAYER_",
+
+    CommandRateLimit    = 20,    -- requests per second per player (default 20)
+    MaxInboundBytes     = 4096,  -- maximum frame size in bytes (default 8192)
+})
+```
+
+<Tip>
+  Keep `MaxInboundBytes` tight. If you know the largest legitimate command payload your game sends, set this to that value. Smaller is better — it rejects oversized frames before they are decoded.
+</Tip>
+
+## ServerOnly Fields
+
+Fields declared with `Scribe.ServerOnly(...)` never enter a client queue at all. Diff operations are stripped before queueing, including `ServerOnly` descendants nested inside a whole-container `Set`. Snapshots go through the same filter.
+
+```lua
+local template = {
+    Coins      = Scribe.Int(0, { Min = 0 }),
+    Suspicion  = Scribe.ServerOnly(0),  -- never replicated
+}
+```
+
+`ServerOnly` fields are absent from the client type, so reading one on the client is a compile error rather than a `nil` at runtime. See the [Replication guide](/guides/replication) for full visibility rules.
+
+## The OnAnomaly Signal
+
+`Data.OnAnomaly` fires when Scribe detects a data integrity issue. Each event carries a path, the offending value, and a reason.
+
+```lua
+Data.OnAnomaly:Connect(function(anomaly)
+    warn(`Anomaly at {anomaly.Path}: {anomaly.Reason}`)
+end)
+```
+
+Possible reasons include `OutOfBounds`, `OverMaxLength`, `InvalidUtf8`, `NotAMember`, and `NonFiniteComponent`.
+
+<Warning>
+`OnAnomaly` is a **correctness signal**, not an abuse signal. Every one of those reasons fires on a server-side write — your own game code writing a value the template refuses. A client cannot cause them. Do not kick players for `OnAnomaly` events; you would be kicking players for your own logic errors.
+</Warning>
+
+## The Exchange Allowlist
+
+The exchange system validates all legs of every trade against the `Exchangeable` allowlist you declare in your Scribe options. Nothing moves unless both the giving and receiving paths are explicitly listed there, and the amounts satisfy the declared constraints.
+
+```lua
+Scribe({
+    Template = template,
+    ProfileStoreIndex = "PlayerData",
+    ProfileKeyPrefix  = "PLAYER_",
+
+    Exchangeable = {
+        Coins = { Min = 1 },
+        Gems  = { Min = 1 },
+    },
+})
+```
+
+A path not in `Exchangeable` cannot participate in any exchange, regardless of what the client requests.
+
+## The Audit Trail
+
+Scribe keeps version history for every profile. You can list versions, read a specific one, and restore the profile to any past state — without touching the live data until you confirm.
+
+```lua
+-- List the 10 most recent versions of a player's profile.
+local versions, reason = Data.ListVersions(userId, 10)
+
+-- Read a specific version.
+local snapshot, reason = Data.GetVersion(userId, versionKey)
+
+-- Restore the profile to a past version.
+local ok, reason = Data.RestoreVersion(userId, versionKey, { Force = false })
+```
+
+<Note>
+  `RestoreVersion` is guarded by WipeGuard by default. Pass `{ Force = true }` to bypass it when you are intentionally restoring an older snapshot.
+</Note>
+
+## Configuration Reference
+
+All security-related options are set in the `Scribe({...})` call:
+
+| Option | Default | When to tighten |
+| --- | --- | --- |
+| `CommandRateLimit` | 20/s | Your commands are infrequent and you want spam caught sooner |
+| `MaxInboundBytes` | 8192 | You know your largest legitimate command payload |
+| `MaxInboundFrameRate` | `max(60, CommandRateLimit × 4)` | You have measured your busiest legitimate client |
+| `BoundsPolicy` | `"Clamp"` | A bad write should throw, not silently clamp |
+| `WipeGuardPolicy` | `"Warn"` | A suspected wipe should not reach the DataStore at all |
+| `SchemaPolicy` | absent | You want load-time validation of stored data |
+| `VersionAheadPolicy` | `"Kick"` | You are doing a rolling deploy with compatible schemas |
+| `WipeGuardShrinkRatio` | 0.5 | Tune the shrink threshold for your data shape |
+
+## What to Alert On
+
+Route these codes to your backend with `AddLogSink`. The full list is in the log code reference.
+
+| Code | Reading |
+| --- | --- |
+| `MALFORMED_FRAME_LIMIT`, `INBOUND_OVERSIZE_LIMIT` | Scribe has stopped parsing this client's frames |
+| `INBOUND_RATE_LIMITED` | Traffic volume no real client produces |
+| `COMMAND_UNKNOWN` in volume | Someone probing for command names |
+| `PURCHASE_ID_EVICTED` | A retried receipt could now double-grant |
+| `WIPE_GUARD_TRIPPED` | Data loss, whatever the cause |
+| `ANOMALY` | A bug in your write path |
+
+## What Scribe Deliberately Does Not Do
+
+- **No enforcement.** Nothing kicks, throttles, or bans a player for suspicious traffic. Crossing the malformed or oversize limit stops Scribe parsing their frames. They stay connected, and every response beyond that is yours.
+- **No anti-cheat.** Scribe sees the data layer. Speed hacks and exploit GUIs are invisible to it. Treat it as one signal feeding your anti-cheat, never as the anti-cheat itself.
+- **No ban list.** Banning is irreversible and needs an appeals process. That belongs to you.
+
+<CardGroup cols={2}>
+  <Card title="Commands" icon="terminal" href="/guides/commands">
+    The full Args vocabulary and the dispatch order behind the inbound gauntlet.
+  </Card>
+  <Card title="Replication" icon="arrows-rotate" href="/guides/replication">
+    ServerOnly, Shared, and Session visibility rules.
+  </Card>
+  <Card title="Diagnostics" icon="chart-line" href="/guides/diagnostics">
+    Log sinks and metrics to turn these codes into alerts.
+  </Card>
+  <Card title="Monetization" icon="coins" href="/guides/monetization">
+    Receipts, idempotency keys, and how grants fail closed.
+  </Card>
+</CardGroup>

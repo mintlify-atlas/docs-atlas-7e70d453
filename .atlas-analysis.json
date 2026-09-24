@@ -1,0 +1,157 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "Scribe",
+  "projectDescription": "Persistent, fully-typed, automatically-replicated player data for Roblox Luau and roblox-ts, built on ProfileStore.",
+  "theme": "luma",
+  "primaryColor": "#5B6AD0",
+  "lightColor": "#EEF0FC",
+  "darkColor": "#1A1D3A",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Guides",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "guides/introduction",
+              "guides/quickstart",
+              "guides/installation",
+              "guides/templates"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "guides/values",
+              "guides/containers",
+              "guides/lifecycle",
+              "guides/replication",
+              "guides/commands"
+            ]
+          },
+          {
+            "group": "Features",
+            "pages": [
+              "guides/monetization",
+              "guides/leaderboards",
+              "guides/transactions",
+              "guides/gifting",
+              "guides/exchange",
+              "guides/migrations"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "guides/diagnostics",
+              "guides/security",
+              "guides/server-store",
+              "guides/addons",
+              "guides/roblox-ts"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "API",
+            "pages": [
+              "api/overview",
+              "api/scribe",
+              "api/server",
+              "api/client",
+              "api/value",
+              "api/types"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Fully-typed accessor tree generated at type-check time from your template (e.g. data.Coins.Increment(50))",
+    "Automatic schema-compressed replication to clients over a pluggable transport with no RemoteEvents to wire up",
+    "Built-in leaderboards, gifting, monetization, and player-to-player exchanges",
+    "Fail-closed session locking built on ProfileStore with migrations, wipe guard, and version history",
+    "Scribe.Big for arbitrarily large numbers with full arithmetic and leaderboard support",
+    "Containers: ArrayOf, DictOf, MapOf, SetOf, and Flags with per-element typing and size caps",
+    "Optional add-ons: ScribeTelemetry (Discord webhook diagnostics), ScribeLeaderstats, and UI adapters for Vide, React, and Fusion",
+    "roblox-ts support via @rbxts/scribe with inferred schema types"
+  ],
+  "publicApiSurface": [
+    "Scribe(options: ScribeOptions<T, S>) -> Bundle<T, S>",
+    "Bundle.Server (ServerData<T, S>)",
+    "Bundle.Client (ClientData<T, S>)",
+    "Server.Get(player) -> PlayerData<T>",
+    "Server.WaitForData(player, timeout?) -> (data?, reason?)",
+    "Server.GetState(player) -> (SessionState, LoadPhase?)",
+    "Server.Batch(player, fn)",
+    "Server.Transaction(player, fn) -> (boolean, string?)",
+    "Server.Flush(player, opts?) -> boolean",
+    "Server.GetSaveInfo(player) -> SaveInfo",
+    "Server.GetOffline(userId) -> data?",
+    "Server.UpdateOffline(userId, fn, opts?) -> (boolean, string?, history?)",
+    "Server.ListVersions(userId, limit?) -> VersionRecord[]",
+    "Server.GetVersion(userId, versionId) -> data?",
+    "Server.RestoreVersion(userId, versionId, opts?) -> (boolean, string?)",
+    "Server.Command(name, spec?, handler)",
+    "Server.GetLeaderboard(name, limit?, server?) -> LeaderboardEntry[]",
+    "Server.GetMyRank(player, name) -> number?",
+    "Server.GetLeaderboardStatus(name) -> LeaderboardStatusInfo?",
+    "Server.Purchase(player, spec: PurchaseSpec) -> (boolean, string?)",
+    "Server.PromptPurchase(player, productName) -> (boolean, string?)",
+    "Server.PromptGift(player, productName, recipientId) -> (boolean, string?)",
+    "Server.Owns(player, key) -> boolean",
+    "Server.GrantPerk(player, key)",
+    "Server.RevokePerk(player, key)",
+    "Server.OnCooldown(player, key, duration, opts?) -> (boolean, number)",
+    "Server.Exchange.Attempt(playerA, legsA, playerB, legsB) -> (string?, string?)",
+    "Server.Erase(userId) -> (boolean, string?)",
+    "Server.Export(userId) -> string?",
+    "Server.Stop()",
+    "Client.Get() -> PlayerData<T>",
+    "Client.WaitForData(timeout?) -> boolean",
+    "Client.IsReady() -> boolean",
+    "Client.Request(name, ...args) -> ...any",
+    "Client.GetLeaderboard(name, limit?) -> LeaderboardEntry[]",
+    "Client.Owns(key) -> boolean",
+    "Client.PromptPurchase(productName) -> (boolean, string?, info?)",
+    "Client.Stop()",
+    "Value.Get() -> T",
+    "Value.Set(value, silent?) -> T",
+    "Value.Update(fn, silent?) -> T",
+    "Value.Observe(callback) -> Disconnect",
+    "Value.Changed(callback) -> Disconnect",
+    "Value.Increment(n, tag?) -> number",
+    "Value.Decrement(n, tag?) -> number",
+    "Value.Toggle(silent?) -> boolean",
+    "Value.Insert(element, index?, silent?) -> ()",
+    "Value.Remove(index?, silent?) -> element?",
+    "Value.Add(element, silent?) -> boolean",
+    "Value.Has(element) -> boolean",
+    "Value.Clear(silent?)",
+    "Value.SetTimed(value, duration, silent?)",
+    "Value.Active() -> (boolean, expiry?)",
+    "Scribe.Int(default, meta?)",
+    "Scribe.Number(default, meta?)",
+    "Scribe.String(default, meta?)",
+    "Scribe.Bool(default)",
+    "Scribe.Big(default, meta?)",
+    "Scribe.Flags(members)",
+    "Scribe.SetOf(element)",
+    "Scribe.ArrayOf(element, opts?)",
+    "Scribe.DictOf(element, opts?)",
+    "Scribe.MapOf(keyType, element, opts?)",
+    "Scribe.Timed(duration)",
+    "Scribe.ServerOnly(value)",
+    "Scribe.Derived(fn)",
+    "Scribe.GetStatus() -> Status",
+    "Scribe.GetBudgetSnapshot() -> BudgetSnapshot",
+    "Scribe.GetRecentLogs(level?) -> LogEntry[]",
+    "Scribe.AddLogSink(callback, opts?) -> Disconnect",
+    "Scribe.Configure(options)"
+  ]
+}

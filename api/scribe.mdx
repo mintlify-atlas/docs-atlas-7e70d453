@@ -1,0 +1,604 @@
+---
+title: "Scribe Module API: Constructor and Declarators"
+sidebarTitle: "Scribe"
+description: "Complete reference for the Scribe module: the bundle constructor, every field and container declarator, visibility wrappers, and global helpers."
+---
+
+The `Scribe` module is the entry point for every Scribe-powered data system. Require it in a shared `ModuleScript`, call it with your options table to receive a `{ Server, Client }` bundle, and use the declarators to describe your data shape. Everything on this page is available on both the server and the client through the same shared module.
+
+---
+
+## Constructor
+
+### `Scribe(options)` → `Bundle<T, S>`
+
+Compiles the template and constructs a `{ Server, Client }` bundle. Calling the module directly is equivalent to calling `Scribe.new(options)`.
+
+```lua
+local Scribe = require(game.ReplicatedStorage.Scribe)
+
+local Data = Scribe({
+    Template = {
+        Coins    = Scribe.Int(0, { Min = 0 }),
+        Level    = Scribe.Int(1, { Min = 1 }),
+        Username = Scribe.String(""),
+    },
+    ProfileStoreIndex = "PlayerData",
+    ProfileKeyPrefix  = "PLAYER_",
+})
+
+-- Server scripts use Data.Server; LocalScripts use Data.Client
+```
+
+<ParamField body="options" type="ScribeOptions<T, S>" required>
+  The full configuration table. Three fields are required; all others are optional. See [`ScribeOptions`](/api/types#scribeoptions) for the complete list.
+
+  <Expandable title="Required fields">
+    <ParamField body="Template" type="T" required>
+      Your data shape, built from plain values and declarators. Every key becomes a typed accessor node.
+    </ParamField>
+    <ParamField body="ProfileStoreIndex" type="string" required>
+      The DataStore name. Each game must use its own unique name.
+    </ParamField>
+    <ParamField body="ProfileKeyPrefix" type="string" required>
+      Prefix for per-player profile keys, such as `"PLAYER_"`. Pass `""` to use bare user-id keys.
+    </ParamField>
+  </Expandable>
+
+  <Expandable title="Key optional fields">
+    <ParamField body="Mode" type='"Live" | "Mock" | "NoSave"'>
+      Persistence mode. `"Live"` (default) uses real DataStores. `"Mock"` runs in-memory without persisting. `"NoSave"` loads but never saves — useful for read-only admin tools.
+    </ParamField>
+    <ParamField body="ServerStore" type="S">
+      Declares server-owned state that is replicated to all clients but not tied to any player profile.
+    </ParamField>
+    <ParamField body="SaveInterval" type="number">
+      Seconds between autosaves per profile. Default `300`, floor `15`.
+    </ParamField>
+    <ParamField body="Transport" type="ScribeTransport | string">
+      Custom transport adapter, or `"Default"` (the built-in `RemoteEvent` channel).
+    </ParamField>
+    <ParamField body="Leaderboards" type="{ [string]: LeaderboardConfig }">
+      Named leaderboard configurations. Each board's `Stat` is a dot-joined path to a numeric field.
+    </ParamField>
+    <ParamField body="Products" type="{ [string]: ProductConfig }">
+      Roblox developer products declared by name. Required to handle receipts through Scribe.
+    </ParamField>
+    <ParamField body="Passes" type="{ [string]: PassConfig }">
+      Roblox game passes declared by name.
+    </ParamField>
+    <ParamField body="Exchangeable" type="{ [string]: ExchangeableSpec }">
+      Allowlist of paths and kinds that `Server.Exchange.Attempt` may move.
+    </ParamField>
+    <ParamField body="OnPlayerInit" type="(player: Player, data: ValueType<T>) -> ()">
+      Runs once per new profile, after migration but before replication.
+    </ParamField>
+    <ParamField body="Migrations" type="{ [number]: (data, migration: MigrationContext) -> () }">
+      Versioned migration callbacks applied in order when loading an older profile.
+    </ParamField>
+    <ParamField body="DevMode" type="boolean">
+      Overrides the `RunService:IsStudio()` default; enables extra collision checks and verbose warnings.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ResponseField name="Bundle" type="{ Server: Server<T,S>, Client: Client<T,S> }">
+  The compiled bundle. Use `Bundle.Server` in server scripts and `Bundle.Client` in LocalScripts.
+</ResponseField>
+
+---
+
+## Field Declarators
+
+Declarators describe the type and constraints of each leaf in your template. Use them as values inside the `Template` table.
+
+### `Scribe.Int(default, meta?)` → `number`
+
+Declares an integer field. Non-integer writes round; out-of-range writes clamp (or reject under `BoundsPolicy = "Reject"`). Bounded integers also pack to a narrower wire width.
+
+```lua
+Coins = Scribe.Int(0, { Min = 0 }),
+Score = Scribe.Int(0, { Min = 0, Max = 999999 }),
+```
+
+<ParamField body="default" type="number" required>
+  The initial value for new profiles.
+</ParamField>
+<ParamField body="meta" type="{ Min: number?, Max: number? }">
+  Optional bounds. Both must be finite integers.
+</ParamField>
+
+---
+
+### `Scribe.Number(default, meta?)` → `number`
+
+Declares a floating-point field with optional bounds and an optional narrowed wire representation.
+
+```lua
+Health = Scribe.Number(100, { Min = 0, Max = 100, Precision = 0.5 }), -- 1 byte on the wire
+Speed  = Scribe.Number(16.0),
+```
+
+<ParamField body="default" type="number" required>
+  The initial value for new profiles.
+</ParamField>
+<ParamField body="meta" type="FloatMeta">
+  Optional bounds and precision hint. `Precision` narrows the replicated copy only — the server always stores the full double.
+
+  <Expandable title="FloatMeta fields">
+    <ParamField body="Min" type="number">Finite lower bound.</ParamField>
+    <ParamField body="Max" type="number">Finite upper bound.</ParamField>
+    <ParamField body="Precision" type="number">
+      Fixed-point step size. Requires both `Min` and `Max`. Bounds too wide for the requested step refuse at compile time.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+---
+
+### `Scribe.Big(default?, meta?)` → `BigValue`
+
+A number with unlimited range, for idle or simulator currencies that run past `2^53`. Carries about 15 significant digits at any magnitude.
+
+```lua
+Essence = Scribe.Big(0, { Min = 0, Max = "1e600" }),
+-- data.Essence.Get():Short()  -->  "1.95Dc"
+```
+
+<ParamField body="default" type="number | string">
+  The starting value. A bound or default past `1.8e308` must be a numeric string. Defaults to `0`.
+</ParamField>
+<ParamField body="meta" type="BigMeta">
+  <Expandable title="BigMeta fields">
+    <ParamField body="Min" type="number | string">Lower bound; numeric string for values past the double range.</ParamField>
+    <ParamField body="Max" type="number | string">Upper bound.</ParamField>
+  </Expandable>
+</ParamField>
+
+<Note>
+  `Get()` returns a [`BigValue`](/api/types#bigvalue), not a plain number. Comparing it with `<` against a plain number throws. Use `Value.Increment`, `Value.Decrement`, `Value.Multiply`, and `Value.Divide` for arithmetic, or call `:ToNumber()` to convert for display.
+</Note>
+
+---
+
+### `Scribe.String(default, meta?)` → `string`
+
+Declares a string field with an optional byte-length cap.
+
+```lua
+Username = Scribe.String(""),
+Bio      = Scribe.String("", { MaxLength = 200 }),
+```
+
+<ParamField body="default" type="string" required>Initial value.</ParamField>
+<ParamField body="meta" type="{ MaxLength: number? }">
+  `MaxLength` is a byte budget. Over-long values are truncated on a character boundary, or rejected under `BoundsPolicy = "Reject"`.
+</ParamField>
+
+---
+
+### `Scribe.Bool(default)` → `boolean`
+
+Declares a boolean field with a `Toggle` mutator.
+
+```lua
+TutorialDone = false,         -- plain Lua boolean works for simple fields
+IsPremium    = Scribe.Bool(false), -- use this when you need explicit typing
+```
+
+<Note>
+  Plain Lua `true` or `false` in a template also declares a boolean field. `Scribe.Bool` is useful when you want the explicit declarator syntax for clarity.
+</Note>
+
+<ParamField body="default" type="boolean" required>Initial value.</ParamField>
+
+---
+
+### `Scribe.Flags(members)` → `Flags`
+
+A fixed set of named booleans stored as one field (up to 32 members). Members are addressed by name using `Enable`, `Disable`, `Has`, `Toggle`, `Count`, and `Clear`.
+
+```lua
+Settings = Scribe.Flags({ "Music", "Sfx", "TutorialDone" }),
+-- data.Settings.Enable("Music")
+-- data.Settings.Has("Music")  --> true
+```
+
+<ParamField body="members" type="{ string }" required>
+  The full list of valid member names. More than 32 members refuses at compile time.
+</ParamField>
+
+---
+
+### `Scribe.CFrame(default, meta?)` → `CFrame`
+
+Declares a CFrame field. Packs lossily by default (position 3×F32 + compressed rotation); pass `Precision = "exact"` for a full 49-byte lossless form.
+
+```lua
+SpawnPoint = Scribe.CFrame(CFrame.new()),
+Camera     = Scribe.CFrame(CFrame.identity, { Precision = "exact" }),
+```
+
+<ParamField body="default" type="CFrame" required>Initial value.</ParamField>
+<ParamField body="meta" type="CFrameMeta">
+  <Expandable title="CFrameMeta fields">
+    <ParamField body="Precision" type='"exact"'>
+      Stores and replicates the full double-precision form instead of the default lossy pack.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+---
+
+### Other Roblox datatype declarators
+
+All Roblox datatype fields store and replicate as compact packed buffers. `Get`/`Set` convert at the boundary so your code always sees the real type.
+
+```lua
+Scribe.Vector3(default: Vector3)
+Scribe.Vector2(default: Vector2)
+Scribe.Color3(default: Color3)
+Scribe.BrickColor(default: BrickColor)
+Scribe.UDim(default: UDim)
+Scribe.UDim2(default: UDim2)
+Scribe.Rect(default: Rect)
+Scribe.NumberRange(default: NumberRange)
+Scribe.NumberSequence(default: NumberSequence)
+Scribe.ColorSequence(default: ColorSequence)
+Scribe.DateTime(default: DateTime)
+Scribe.EnumItem(default: EnumItem)
+Scribe.Font(default: Font)
+Scribe.PhysicalProperties(default: PhysicalProperties)
+```
+
+---
+
+### `Scribe.Enum(default, members)` → `string`
+
+Declares a string field restricted to a fixed set of values. Writes outside the set are rejected, and the value packs to a single byte.
+
+```lua
+Difficulty = Scribe.Enum("Normal", { "Easy", "Normal", "Hard" }),
+```
+
+<ParamField body="default" type="string" required>Must be a member of the declared set.</ParamField>
+<ParamField body="members" type="{ string }" required>The complete set of valid values.</ParamField>
+
+---
+
+### `Scribe.Optional(inner)` → `T?`
+
+Allows a leaf field to be legitimately absent. The inner declarator's default is dropped; `Get()` returns `nil` until a write, and `Set(nil)` removes the value.
+
+```lua
+Nickname = Scribe.Optional(Scribe.String("", { MaxLength = 20 })),
+```
+
+<ParamField body="inner" type="T" required>A scalar declarator supplying type and bounds. Containers, `Timed`, and `Dynamic` are not allowed inside `Optional`.</ParamField>
+
+---
+
+## Container Declarators
+
+Containers hold collections of typed elements. Use them for inventories, leaderboards, and any collection that grows at runtime.
+
+### `Scribe.ArrayOf(shape, opts?)` → `{ T }`
+
+A typed ordered array. Elements have a schema, so type checking, bounds, and datatype packing apply per element.
+
+```lua
+PlacedFurniture = Scribe.ArrayOf({
+    Cf     = Scribe.CFrame(CFrame.new()),
+    ItemId = Scribe.String("", { MaxLength = 64 }),
+}, { MaxItems = 200, Evict = "Front" }),
+```
+
+<ParamField body="shape" type="T" required>
+  A record or a single leaf declarator describing each element.
+</ParamField>
+<ParamField body="opts" type="ArrayOpts">
+  <Expandable title="ArrayOpts fields">
+    <ParamField body="MaxItems" type="number">
+      Refuses growth past this cap. An already-oversized container remains writable, so a rolling deploy is safe.
+    </ParamField>
+    <ParamField body="Evict" type='"Front" | "Back"'>
+      Requires `MaxItems`. Names the end that a `Insert` at the cap drops from.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+---
+
+### `Scribe.DictOf(shape, opts?)` → `{ [string]: V }`
+
+A string-keyed dictionary whose values have a schema. A key exists only after something writes it.
+
+```lua
+Inventory = Scribe.DictOf({
+    Count = Scribe.Int(1, { Min = 1, Max = 999 }),
+}, { MaxKeys = 200 }),
+```
+
+<ParamField body="shape" type="V" required>A record or leaf declarator for each value.</ParamField>
+<ParamField body="opts" type="DictOpts">
+  <Expandable title="DictOpts fields">
+    <ParamField body="MaxKeys" type="number">Caps the number of keys.</ParamField>
+    <ParamField body="MaxKeyLength" type="number">Caps each key's byte length.</ParamField>
+  </Expandable>
+</ParamField>
+
+---
+
+### `Scribe.SetOf(element, opts?)` → `SetOf<T>`
+
+A collection of unique scalar entries. Members are stored deduplicated and sorted. Use it where you would otherwise store a `{ [T]: true }` dictionary.
+
+```lua
+Unlocked = Scribe.SetOf(Scribe.String("", { MaxLength = 32 })),
+-- data.Unlocked.Add("AshfallRidge")    --> true
+-- data.Unlocked.Has("AshfallRidge")    --> true
+```
+
+<ParamField body="element" type="T" required>
+  A scalar declarator. Record shapes are refused because sets require comparable entries.
+</ParamField>
+<ParamField body="opts" type="SetOpts">
+  <Expandable title="SetOpts fields">
+    <ParamField body="MaxItems" type="number">
+      Caps membership. The cap always refuses rather than evicting.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+---
+
+### `Scribe.MapOf(keyType, value, opts?)` → `MapOf<K, V>`
+
+A dictionary with a declared key type, so integer keys come back as numbers rather than strings.
+
+```lua
+Friends = Scribe.MapOf("integer", { Name = Scribe.String("") }),
+-- data.Friends[ava.UserId].Name.Set("Ava")   -- no tostring needed
+```
+
+<ParamField body="keyType" type='"integer" | "string"' required>
+  `"integer"` or `"string"`. Anything else errors at declaration.
+</ParamField>
+<ParamField body="value" type="V" required>A record or leaf declarator for each value.</ParamField>
+<ParamField body="opts" type="DictOpts">
+  `MaxKeys` and `MaxKeyLength`. `MaxKeyLength` with `keyType = "integer"` is an error.
+</ParamField>
+
+---
+
+## Wrapper Declarators
+
+Wrappers modify how a field is persisted, replicated, or computed. They can be combined with any field or container declarator.
+
+### `Scribe.Timed(default)` → `Timed<T>`
+
+Declares a field with an expiry. Set it with `Value.SetTimed(value, seconds)`; it auto-clears back to `default` when the timer lapses and fires `Changed`.
+
+```lua
+ActiveBoost = Scribe.Timed(""),     -- cleared when the boost expires
+LastDaily   = Scribe.Timed(0),      -- a timestamp cleared after 24 h
+```
+
+<ParamField body="default" type="T" required>The value the field resets to when the timer lapses.</ParamField>
+
+---
+
+### `Scribe.ServerOnly(value)` → `ServerOnly<T>`
+
+Marks a field server-only. It persists and is readable on the server but is never replicated to any client. The field is absent from the client's accessor type — reading it from a `LocalScript` is a type error.
+
+```lua
+AdminNotes  = Scribe.ServerOnly(Scribe.String("")),
+BanReason   = Scribe.ServerOnly(Scribe.Optional(Scribe.String(""))),
+```
+
+<ParamField body="value" type="T" required>Any declarator, including containers and other wrappers.</ParamField>
+
+---
+
+### `Scribe.Shared(value)` → `T`
+
+Marks a root field shared: it replicates to every client, not just the owner. Use it for public information such as display names or team assignments.
+
+```lua
+DisplayName = Scribe.Shared(Scribe.String("")),
+Team        = Scribe.Shared(Scribe.Enum("Red", { "Red", "Blue" })),
+```
+
+<ParamField body="value" type="T" required>Any declarator. Combining with `ServerOnly` is a startup error.</ParamField>
+
+---
+
+### `Scribe.Session(value)` → `T`
+
+Marks a root field session-only: never persisted, resets on every join. Ideal for runtime state like `InCombat` that should not survive a disconnect.
+
+```lua
+InCombat    = Scribe.Session(false),
+JoinedAt    = Scribe.Session(Scribe.Dynamic(os.time)),
+```
+
+<ParamField body="value" type="T" required>Any declarator. Doubling it up is a startup error.</ParamField>
+
+---
+
+### `Scribe.Derived(output, inputs, compute)` → `Derived<T>`
+
+A read-only field computed from other declared fields. Never persisted, never migrated, recomputed whenever an input changes.
+
+```lua
+TotalScore = Scribe.Derived(
+    Scribe.Int(0),
+    { "Wins", "Streak" },
+    function(wins, streak) return wins * 100 + streak * 10 end
+),
+```
+
+<ParamField body="output" type="T" required>An ordinary declarator supplying the type and bounds.</ParamField>
+<ParamField body="inputs" type="{ string }" required>Dot-joined paths to statically declared scalar fields, passed to `compute` in order.</ParamField>
+<ParamField body="compute" type="(...any) -> T" required>Must be pure. Called once at startup to seed the default.</ParamField>
+
+---
+
+### `Scribe.Dynamic(factory)` → `T`
+
+A field whose default is produced by `factory` per profile rather than frozen at server start.
+
+```lua
+CreatedUnix = Scribe.Dynamic(os.time),
+JoinedAt    = Scribe.Dynamic(function() return DateTime.now() end),
+```
+
+<ParamField body="factory" type="() -> T" required>
+  Must be pure and must not yield. Called once at module load to sample the return type, and once per new profile.
+</ParamField>
+
+---
+
+## Global Helpers
+
+These functions and properties are available anywhere you hold the `Scribe` module reference.
+
+### `Scribe.Configure(options)`
+
+Sets configuration that belongs to the process rather than to one bundle. Call it once, before constructing any bundle.
+
+```lua
+Scribe.Configure({ AutoSaveInterval = 60 })
+```
+
+<ParamField body="options" type="{ AutoSaveInterval: number? }" required>
+  `AutoSaveInterval` sets ProfileStore's process-wide autosave cadence in seconds (floor 15). Calling `Configure` twice with different values, or after a bundle exists, is an error.
+</ParamField>
+
+---
+
+### `Scribe.GetStatus()` → `Status`
+
+The current data-service health, derived from ProfileStore's error signals with hysteresis.
+
+```lua
+local status = Scribe.GetStatus()  -- "Healthy" | "Degraded" | "Outage"
+```
+
+<ResponseField name="Status" type='"Healthy" | "Degraded" | "Outage"'>
+  Current DataStore health. Also broadcast to clients via `Client.GetServiceStatus`.
+</ResponseField>
+
+---
+
+### `Scribe.OnStatusChanged` — Signal
+
+Fires with the new `Status` string whenever service health changes. Connect with `:Connect(function(status) ... end)`.
+
+---
+
+### `Scribe.GetBudgetSnapshot()` → `BudgetSnapshot`
+
+The DataStore request allowance the engine currently reports, by request type.
+
+```lua
+local budget = Scribe.GetBudgetSnapshot()
+if budget.Available and budget.Budgets.UpdateAsync < 10 then
+    warn("running low on save allowance")
+end
+```
+
+<ResponseField name="BudgetSnapshot" type="BudgetSnapshot">
+  See [`BudgetSnapshot`](/api/types#budgetsnapshot). `Available` is `false` when the engine could not be queried (e.g. Studio with API access off). Treat that as no opinion, not as zero allowance.
+</ResponseField>
+
+---
+
+### `Scribe.GetRecentLogs(filter?)` → `LogEntry[]`
+
+Returns entries from the internal ring buffer in chronological order (newest last). The ring holds 512 entries by default.
+
+```lua
+local warns = Scribe.GetRecentLogs({ Level = "Warn", Limit = 20 })
+```
+
+<ParamField body="filter" type="{ Level: LogLevel?, Category: LogCategory?, Code: LogCode?, Limit: number? }">
+  Optional filter. `Limit` keeps the most recent N entries.
+</ParamField>
+
+<ResponseField name="LogEntry[]" type="{ LogEntry }">
+  See [`LogEntry`](/api/types#logentry) for the full shape.
+</ResponseField>
+
+---
+
+### `Scribe.AddLogSink(callback, opts?)` → `Disconnect`
+
+Registers a log sink. Every entry that passes the filter is dispatched to `callback`. Returns a function to detach the sink.
+
+```lua
+local disconnect = Scribe.AddLogSink(function(entry)
+    -- forward to your analytics pipeline
+    print(entry.Level, entry.Code, entry.Message)
+end, { Level = "Warn" })
+```
+
+<ParamField body="callback" type="(entry: LogEntry) -> ()" required>Called for each matching entry.</ParamField>
+<ParamField body="opts" type="LogSinkOptions">
+  <Expandable title="LogSinkOptions fields">
+    <ParamField body="Level" type="LogLevel">Only dispatch entries at this level or above.</ParamField>
+    <ParamField body="MaxQueued" type="number">Bounded queue depth per sink (default 128). On overflow, more severe entries replace lower-severity ones.</ParamField>
+  </Expandable>
+</ParamField>
+
+---
+
+### `Scribe.GetLeaderboardSnapshot()` → `LeaderboardSnapshotEntry[]`
+
+Cached health for every board in running server bundles. Makes no DataStore requests. Empty on clients and when no boards are running.
+
+---
+
+### `Scribe.Short(value, decimals?)` → `string`
+
+Formats a number or `BigValue` with short suffixes such as `"1.5K"`, `"100M"`, `"2.4B"`.
+
+```lua
+local label = Scribe.Short(data.Coins.Get())          -- "1.5M"
+local exact = Scribe.Short(data.Coins.Get(), 0)        -- "2M" (rounded, 0 decimals)
+```
+
+<ParamField body="value" type="number | BigValue" required>A plain number or a `Scribe.Big` value.</ParamField>
+<ParamField body="decimals" type="number">Decimal places, default `2`. Must be a non-negative integer.</ParamField>
+
+---
+
+### Named constant tables
+
+Scribe ships named constant tables so you can branch on reasons without guessing at spellings.
+
+| Table | Type | Members |
+|---|---|---|
+| `Scribe.Reason` / `Scribe.LifecycleReason` | `LifecycleReason` | `LoadFailed`, `MigrationFailed`, `Erasing`, `SessionEnded`, `PlayerLeft`, `Shutdown`, `StillLoading`, `Timeout` |
+| `Scribe.RequestReason` | `RequestReason` | `RateLimited`, `NotReady`, `UnknownCommand`, `BadArgs`, `BadIdempotencyKey`, `Error`, `ReplyEncodeFailed`, `Timeout`, `SendFailed`, `EditMode`, `MockError` |
+| `Scribe.PurchaseReason` | `PurchaseReason` | Named constants for every `Server.Purchase` refusal string |
+| `Scribe.GiftReason` | `GiftReason` | Named constants for every `Server.PromptGift` refusal string |
+| `Scribe.ProductState` | `ProductState` | `Purchasable`, `Owned`, `PaidRandomRestricted`, `PolicyPending`, `NotLoaded` |
+| `Scribe.SessionState` | `SessionState` | `Loading`, `Ready`, `SessionEnded` |
+| `Scribe.LoadPhase` | `LoadPhase` | `WaitingForErase`, `AcquiringSession`, `ReadingProfile`, `Retrying`, `Initializing`, `Importing`, `ImportThrottled` |
+| `Scribe.Status` | `Status` | `Healthy`, `Degraded`, `Outage` |
+| `Scribe.LogLevel` | `LogLevel` | `Debug`, `Info`, `Warn`, `Error`, `Fatal` |
+| `Scribe.LogCategory` | `LogCategory` | `Persistence`, `Replication`, `Transport`, `Commands`, `Leaderboards`, `Monetization`, `Gifting`, `Integrity`, `Lifecycle`, `Derived`, `Exchanges` |
+| `Scribe.LeaderboardStatus` | `LeaderboardStatus` | `Starting`, `Healthy`, `Degraded` |
+| `Scribe.Visibility` | `Visibility` | `Replicated`, `ServerOnly`, `Shared` |
+
+```lua
+-- Branching without string literals:
+local data, reason = Data.WaitForData(player)
+if reason == Scribe.Reason.StillLoading then
+    -- retry
+elseif reason == Scribe.Reason.PlayerLeft then
+    return
+end
+```

@@ -1,0 +1,209 @@
+---
+title: "Installing Scribe in Your Roblox Project"
+sidebarTitle: "Installation"
+description: "Install Scribe via Wally, the rbxm Studio download, or npm for roblox-ts projects. ProfileStore is bundled — no second dependency required."
+---
+
+Scribe ships as a Wally package, a Studio model download, and an npm package for roblox-ts. All three methods install the same Luau runtime. Choose the method that matches your workflow.
+
+<Note>
+  Scribe includes its own copy of ProfileStore. You do not need to install ProfileStore separately, and you should not point Scribe at a separately installed copy.
+</Note>
+
+<Tabs>
+  <Tab title="Wally">
+
+[Wally](https://wally.run) is the recommended install method for projects that use [Rojo](https://rojo.space) for syncing. It gives you version-pinned, reproducible installs and integrates cleanly with CI pipelines.
+
+**1. Add Scribe to your `wally.toml`:**
+
+```toml
+[dependencies]
+Scribe = "ericplane/scribe@2.5.0"
+```
+
+**2. Run the install command:**
+
+```
+wally install
+```
+
+This creates a `Packages` folder in your project root containing `Scribe` and its bundled dependencies.
+
+**3. Place `Packages` in `ReplicatedStorage` via your Rojo project:**
+
+```json
+{
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "Packages": {
+        "$path": "Packages"
+      }
+    }
+  }
+}
+```
+
+**4. Require Scribe in a shared module:**
+
+```lua
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Scribe = require(ReplicatedStorage.Packages.Scribe)
+```
+
+<Tip>
+  Place `Packages` in `ReplicatedStorage` (not `ServerScriptService`) so the same package can be required from both server scripts and LocalScripts. Scribe itself is realm-`shared` and runs safely on either side.
+</Tip>
+
+  </Tab>
+  <Tab title="Studio (rbxm)">
+
+If you are not using Wally or Rojo, you can install Scribe directly in Studio by inserting the model file from a GitHub release.
+
+**1. Download the model file:**
+
+Go to the [Scribe releases page](https://github.com/ericplane/Scribe/releases) and download `Scribe.rbxm` from the release you want to use.
+
+**2. Insert the model into your place:**
+
+In Studio, right-click on any service in the Explorer panel and choose **Insert from File…**, then select the downloaded `Scribe.rbxm`. This inserts a `Scribe` folder into the place.
+
+**3. Move `Packages` to `ReplicatedStorage`:**
+
+Inside the imported `Scribe` folder, locate the `Packages` folder and drag it into `ReplicatedStorage`. Then delete the now-empty outer `Scribe` folder.
+
+If you already have a `Packages` folder in `ReplicatedStorage`, do not replace it — instead, open the imported `Packages` folder and move only the `Packages.Scribe` item into your existing `Packages` folder.
+
+**4. Require Scribe from your shared module:**
+
+```lua
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Scribe = require(ReplicatedStorage.Packages.Scribe)
+```
+
+<Warning>
+  Keep `Packages` in `ReplicatedStorage`, not `ServerScriptService`. A server-only location prevents the client from requiring the module, which stops replication from initialising.
+</Warning>
+
+  </Tab>
+  <Tab title="roblox-ts (npm)">
+
+Scribe has a full TypeScript declaration package for [roblox-ts](https://roblox-ts.com) projects. It wraps the same Luau runtime with inferred schema and API types.
+
+**Requirements:** roblox-ts 3, TypeScript 5.5, and matching `@rbxts/compiler-types`. Scribe does not require a compiler transformer. Your existing Rojo mapping for `node_modules/@rbxts` includes it automatically.
+
+**1. Install the core package:**
+
+```sh
+npm install @rbxts/scribe
+```
+
+**2. Import and use in a shared module:**
+
+```ts
+// shared/data.ts
+import Scribe from "@rbxts/scribe";
+
+export const template = {
+    Coins: Scribe.Int(0, { Min: 0 }),
+    Settings: { Music: true },
+};
+
+export const Data = Scribe({
+    Template: template,
+    ProfileStoreIndex: "PlayerData",
+    ProfileKeyPrefix: "PLAYER_",
+    Mode: "Mock",
+});
+```
+
+**3. Use the server and client APIs:**
+
+```ts
+// server/data.server.ts
+import { Data } from "shared/data";
+
+game.GetService("Players").PlayerAdded.Connect((player) => {
+    const [data, reason] = Data.Server.WaitForData(player);
+    if (data === undefined) {
+        warn(reason);
+        return;
+    }
+    data.Coins.Increment(50);
+});
+```
+
+```ts
+// client/data.client.ts
+import { Data } from "shared/data";
+
+Data.Client.Coins.Observe((coins) => print(coins));
+```
+
+`WaitForData` returns a `LuaTuple` — use destructuring to receive both results. `Data.Server.Get(player)` is the non-yielding lookup. The Luau shorthand `Data[player]` is not a TypeScript object index; use `Get` instead.
+
+**Optional addon packages** are installed separately and have no effect on the core:
+
+```sh
+npm install @rbxts/scribe-react @rbxts/react
+# or Vide:
+npm install @rbxts/scribe-vide @rbxts/vide
+# or Fusion 0.2:
+npm install @rbxts/scribe-fusion @rbxts/fusion
+# telemetry and leaderstats:
+npm install @rbxts/scribe-telemetry
+npm install @rbxts/scribe-leaderstats
+```
+
+For a complete roblox-ts usage guide including containers, commands, typed boundaries, and UI adapters, see the [roblox-ts guide](/guides/roblox-ts).
+
+  </Tab>
+</Tabs>
+
+## Enabling the Typed API
+
+Scribe's accessor tree is generated by Luau type functions, which require the new Luau type solver. Without it, Scribe still works correctly at runtime — field-specific autocomplete and compile-time checks are the only things that require the setting.
+
+<Tabs>
+  <Tab title="Roblox Studio">
+    1. Open **Explorer** and select the **Workspace** object.
+    2. In the **Properties** panel, find `UseNewLuauTypeSolver`.
+    3. Set it to **Enabled**.
+  </Tab>
+  <Tab title="Luau LSP (VS Code)">
+    In your `luau-lsp` settings (`.luaurc` or extension settings), enable the new type solver:
+
+    ```json
+    {
+      "luau-lsp.fflags.enableNewSolver": true
+    }
+    ```
+  </Tab>
+</Tabs>
+
+<Info>
+  If your template is very large and Luau reports "Code is too complex to typecheck" on the `Scribe({...})` call, see the [Templates guide](/guides/templates) for the annotation workaround that pushes the limit past 256 distinct root fields.
+</Info>
+
+## Verifying Your Install
+
+Once Scribe is in `ReplicatedStorage.Packages`, open the **Command Bar** in Studio and run:
+
+```lua
+print(require(game:GetService("ReplicatedStorage").Packages.Scribe).Version)
+```
+
+You should see the installed version number printed in the Output window. If you see an error, double-check that `Packages.Scribe` is a direct child of `ReplicatedStorage` and that the `Packages` folder was not left inside a nested container.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="bolt" href="/guides/quickstart">
+    Follow the five-step guide to your first working data flow.
+  </Card>
+  <Card title="Templates" icon="table" href="/guides/templates">
+    Declare fields with types, bounds, containers, and computed values.
+  </Card>
+</CardGroup>

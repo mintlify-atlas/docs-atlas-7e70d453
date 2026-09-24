@@ -1,0 +1,244 @@
+---
+title: "Migrating Data and Importing Legacy Stores"
+sidebarTitle: "Migrations"
+description: "Version your template changes with numbered migrations, import data from ProfileStore or any other library, manage GDPR erasure and export, and roll back with version history."
+---
+
+Scribe gives you two distinct tools for evolving player data over time. The `Migrations` option runs numbered transform functions against existing profiles when the stored schema version is behind the current one — for games already on Scribe. `ImportLegacyData` is a one-time hook that reads each player's old record from another library and hands it to Scribe on their first join. The two tools solve different problems and should not be combined on the same store.
+
+## Migrations — evolving your template on Scribe
+
+Add a `Migrations` table to your bundle config: a map from integer version numbers (starting at 2) to transform functions. Each function receives a plain data table and modifies it in place:
+
+```lua
+return Scribe({
+    Template = template,
+    ProfileStoreIndex = "EmberfallData",
+    ProfileKeyPrefix  = "PLAYER_",
+
+    Migrations = {
+        -- Version 2: rename "gold" to "Coins"
+        [2] = function(data)
+            data.Coins = data.gold or 0
+            data.gold  = nil
+        end,
+
+        -- Version 3: flatten nested stats table
+        [3] = function(data)
+            if type(data.stats) == "table" then
+                data.Level    = data.stats.level or 1
+                data.Xp       = data.stats.xp or 0
+                data.stats    = nil
+            end
+        end,
+
+        -- Version 4: convert bag array to DictOf inventory
+        [4] = function(data)
+            local inv = {}
+            for _, item in (data.bag or {}) do
+                inv[item.id] = { Qty = item.count, Rarity = item.rarity or "Common" }
+            end
+            data.Inventory = inv
+            data.bag = nil
+        end,
+    },
+})
+```
+
+Scribe stores the current schema version under the reserved `_Scribe` root. On load it runs every migration step whose number is greater than the stored version, in ascending order. A profile with no version record is treated as version 1, so steps 2 and above apply.
+
+### Migration contract
+
+- **Forward only.** Steps run in ascending order; there is no rollback through the migration chain.
+- **Fail-closed.** A step that throws kicks the player rather than loading them with partially-migrated data. Fix the step, then redeploy — the player can join again once the server carries the fix.
+- **No yields.** Migration functions run synchronously. Do async work outside the callback.
+- **Integers ≥ 2 only.** A key below 2 is a startup error.
+
+<Warning>
+If you adopt an existing ProfileStore in place **while already carrying a `Migrations` table**, step 2 must tolerate the pre-Scribe data shape. There is no step 1 to bridge in: profiles with no version record are treated as version 1, so all steps from 2 upward run on first load.
+</Warning>
+
+### Scribe.Datatypes.Pack for imported values
+
+Inside a migration body — just like inside `ImportLegacyData` — raw Roblox datatypes such as `CFrame` must be packed before being written:
+
+```lua
+[5] = function(data)
+    for _, obj in (data.Camp or {}) do
+        if typeof(obj.Cf) == "CFrame" then
+            obj.Cf = Scribe.Datatypes.Pack("CFrame", obj.Cf)
+        end
+    end
+end,
+```
+
+Writing an unpacked datatype is flagged as `PROFILE_UNPERSISTABLE` at load, which fails the save.
+
+## ImportLegacyData — one-time import from another library
+
+If your data lives in DataStore2, a hand-rolled store, or any library Scribe cannot read directly, use `ImportLegacyData`. The hook runs once per player who has never completed a Scribe save, receives the player and their userId, may yield, and returns a plain table of top-level keys:
+
+```lua
+return Scribe({
+    Template = template,
+    ProfileStoreIndex = "EmberfallData",
+    ProfileKeyPrefix  = "PLAYER_",
+
+    ImportLegacyData = function(player, userId)
+        local old = OldEmberfallStore:Get(userId) -- may yield; fine here
+        if old == nil then
+            return nil -- no legacy record; treat as new player
+        end
+
+        return {
+            Coins     = old.coins or 0,
+            Xp        = old.xp or 0,
+            Inventory = convertOldBag(old.bag),
+        }
+    end,
+})
+```
+
+The imported keys are written before reconciliation, migration, and the first save. Template fields not present in the imported table fill in from their declared defaults. The player is **not** reported as new to `OnPlayerInit`, so a starter kit behind `isNewProfile` does not land on top of an imported inventory.
+
+<Warning>
+Return `nil` **only** when you are certain there is nothing to carry. If your DataStore read failed and you cannot tell, **throw** instead. Scribe cannot distinguish a genuine empty record from a failed read — both lead to a blank profile. A throw refuses the load and lets the player retry on their next join.
+</Warning>
+
+### MigrationContext.AwaitBudget — pacing multi-store reads
+
+When a migration reads multiple DataStore keys (a main store plus sharded leaderboard stores, for example), the burst of concurrent reads can exceed Roblox's throttle. The third argument to `ImportLegacyData` provides a budget queue:
+
+```lua
+ImportLegacyData = function(player, userId, migration)
+    -- Request 3 GetSortedAsync slots; waits first-come-first-served
+    local ok, done = migration.AwaitBudget("GetSortedAsync", 3)
+    local boards = if ok then readThreeOrderedStores(userId) else {}
+    done() -- release the grant as soon as you've sent the requests
+
+    local mainOk, mainDone = migration.AwaitBudget("GetAsync")
+    local main = if mainOk then readMainStore(userId) else nil
+    mainDone()
+
+    return mergeData(main, boards)
+end,
+```
+
+`AwaitBudget(requestType, count?, timeout?)` yields until `count` requests of that type are available (default 1, timeout 120 seconds). It returns `(granted: boolean, release: () -> ())`. Call `release` as soon as you have issued the requests — not after they return. Skipping `release` is safe but causes the next waiter to wait longer than necessary.
+
+Budgets are per request type. `GetSortedAsync` and `GetAsync` draw on different allowances.
+
+<Tip>
+Use `Data.GetState(player)` to read the current load phase. It returns `"Importing"` while the hook runs and `"ImportThrottled"` while it is queued on the budget. Relay this to your loading screen for a "Moving your data across — this may take a moment" message.
+</Tip>
+
+### OnPlayerInit — first-join initialization
+
+`OnPlayerInit` fires for every new profile (one that has never had a Scribe save), after migrations, and receives the same `migration` context as a fourth argument for any paced reads. Use it to grant a starter kit or set first-join timestamps:
+
+```lua
+OnPlayerInit = function(player, data, isNewProfile, migration)
+    if not isNewProfile then return end
+
+    data.Coins = 100
+    data.Inventory["StarterSword"] = { Qty = 1, Rarity = "Common" }
+end,
+```
+
+`OnPlayerInit` is not behind `MigrationConcurrency`, so it runs for every join. Keep it cheap; use `migration.AwaitBudget` only for genuinely necessary reads.
+
+## Already on ProfileStore or ProfileService
+
+A game already on ProfileStore (or ProfileService, its predecessor) can adopt Scribe with no data copy — just point Scribe at the same store and key prefix:
+
+```lua
+return Scribe({
+    Template          = template,
+    ProfileStoreIndex = "EmberfallPlayerData", -- your existing store name
+    ProfileKeyPrefix  = "Player_",             -- your existing key prefix (must match exactly)
+})
+```
+
+New template fields fill in on load. Structural changes go through `Migrations`. The ProfileStore envelope (session metadata, `UserIds`, `GlobalUpdates`) is untouched.
+
+<Warning>
+Do not build the ProfileStore envelope yourself with `SetAsync`. A hand-crafted value that looks like a profile (has `Data`, `MetaData`, and `GlobalUpdates` tables) but is missing `MetaData.SessionLoadCount` will crash every load with an arithmetic error. The key does not self-heal — use `Data.Erase(userId)` to delete it and re-import from the old store.
+</Warning>
+
+## Version history and rollback
+
+Scribe exposes DataStore version history for support and rollback tools.
+
+```lua
+-- List versions (newest first)
+local versions = Data.ListVersions(userId, 10)
+for _, v in versions do
+    print(v.VersionId, v.CreatedAt, v.Size)
+end
+
+-- Read a specific snapshot
+local snapshot = Data.GetVersion(userId, versionId)
+
+-- Restore a version (player must be offline)
+local ok, reason = Data.RestoreVersion(userId, versionId)
+if not ok then
+    warn(`Restore refused: {reason}`)
+end
+```
+
+`RestoreVersion` fails closed if the user has a live session anywhere. The reserved `_Scribe` root (receipts, gifts, perks, purchase log) is **not** rolled back by default — those events did not un-happen. The schema `Version` is the one exception: it travels with the game data so that the migration chain can run correctly. Pass `{ RollBackReserved = true }` only when the `_Scribe` root is itself corrupt.
+
+## MigrationShadow — auditing imports
+
+The `MigrationShadow` option writes every imported or migrated profile to a separate DataStore key before the session begins. Use it during a cutover to audit what Scribe accepted without touching live data:
+
+```lua
+MigrationShadow = "EmberfallMigrationAudit", -- the DataStore name to shadow into
+```
+
+Disable it once the migration is stable. The shadow key is not read by Scribe and must be cleaned up separately.
+
+## GDPR: Erase and Export
+
+### Erase
+
+`Data.Erase(userId)` deletes a user's profile and removes their leaderboard entries. The player must be offline on every server. A long leaderboard history (many periodic boards) can take multiple calls — progress is saved, so retrying resumes from where it left off:
+
+```lua
+local ok, reason = Data.Erase(userId)
+if not ok then
+    warn(`Erase incomplete — retry: {reason}`)
+end
+```
+
+While an erase is in progress, this user's joins are held or refused. Other players join normally. A `false` return means some cleanup remains — retry until `true`.
+
+### Export
+
+`Data.Export(userId)` returns the profile as a JSON string for GDPR data portability requests, or `nil` if no profile exists:
+
+```lua
+local json = Data.Export(userId)
+if json then
+    sendToPlayer(json) -- your delivery mechanism
+end
+```
+
+Buffers in the profile are base64-encoded in the JSON output.
+
+## Where to next
+
+<CardGroup cols={2}>
+  <Card title="Lifecycle" href="/guides/lifecycle">
+    Session loading, WaitForData, and how profiles are initialized.
+  </Card>
+  <Card title="Templates" href="/guides/templates">
+    Declaring fields, containers, and the shape Migrations must match.
+  </Card>
+  <Card title="Diagnostics" href="/guides/diagnostics">
+    PROFILE_UNPERSISTABLE, MIGRATION_FAIL, and LEGACY_IMPORT_FAIL log codes.
+  </Card>
+  <Card title="API: Server" href="/api/server">
+    Full reference for Erase, Export, ListVersions, and RestoreVersion.
+  </Card>
+</CardGroup>

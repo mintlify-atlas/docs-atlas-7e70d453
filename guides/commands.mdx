@@ -1,0 +1,340 @@
+---
+title: "Server Commands and Client Requests in Scribe"
+sidebarTitle: "Commands"
+description: "Register server commands and call them from the client using Request and RequestOnce, with arg validation, idempotency keys, rate limiting, and failure handling."
+---
+
+Client field writes in Scribe are local-only — they update the mirror on that client but never reach the server. When a player needs to change data authoritatively, the correct pattern is a **command**: a named handler you register on the server that the client calls with `Data.Request`. The server validates the arguments, checks the caller's session, runs your handler, and sends the result back. This guide walks through registering commands, validating arguments, handling failures, and building idempotent operations that are safe to retry.
+
+## Your First Command
+
+Register a handler on the server at startup, before any client can call it. Call it from a `LocalScript` using `Data.Request`.
+
+<Tabs>
+  <Tab title="Server (Script)">
+    ```lua
+    -- ServerScriptService/MusicCommand
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local Data = require(ReplicatedStorage.Shared.GameData).Server
+
+    Data.Command("ToggleMusic", { Args = { "boolean" } }, function(player, on)
+        Data[player].Settings.Music.Set(on)
+        return on
+    end)
+    ```
+  </Tab>
+  <Tab title="Client (LocalScript)">
+    ```lua
+    -- StarterPlayerScripts/MusicRequest
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local Scribe = require(ReplicatedStorage.Packages.Scribe)
+    local Data = require(ReplicatedStorage.Shared.GameData).Client
+
+    if not Data.WaitForData() then
+        warn("Data did not arrive; cannot send command")
+        return
+    end
+
+    local musicOn, reason, failed = Data.Request("ToggleMusic", false)
+    if failed == Scribe.RequestFailed then
+        warn("Music request was refused by the framework:", reason)
+        return
+    end
+    print("Music enabled:", musicOn)  --> false: server accepted the setting
+    ```
+  </Tab>
+</Tabs>
+
+`Data.Request` yields until the reply arrives and returns the handler's return values verbatim. The third return value, `Scribe.RequestFailed`, distinguishes a framework refusal from a valid handler result — a handler may legitimately return `false` as its answer, so reading only the first two values cannot tell you who refused.
+
+## Registering Commands
+
+`Data.Command(name, spec, handler)` takes a name string, an optional spec table, and the handler function. With no spec, no validation runs and arguments reach the handler unchecked.
+
+```lua
+-- no spec: any arguments, no validation
+Data.Command("GetServerTime", function(player)
+    return os.time()
+end)
+
+-- with spec: one string argument, validated before the handler runs
+Data.Command("EquipItem", { Args = { "string" } }, function(player, itemId)
+    if not Data[player].Inventory[itemId].Get() then
+        return false, "not owned"
+    end
+    Data[player].Equipped.Set(itemId)
+    return true
+end)
+```
+
+Register every command at server startup, before clients connect. A name with no registration is answered `unknown-command`. Registering the same name twice throws at the call site so you catch it during development.
+
+<Note>
+  The `player` passed to every handler is the real sender, resolved by the engine — never trust a user ID supplied in the argument payload. Use `Data[player]` inside the handler; the Ready gate guarantees `Data[player]` is safe with no `WaitForData` call needed.
+</Note>
+
+## Validating Arguments
+
+The `Args` array lists one spec per positional argument, not counting the leading `player`. The check runs before your handler, refusing the request before it reaches your code.
+
+```lua
+Data.Command("BuyPotion", {
+    Args = {
+        Scribe.Enum("Health", { "Health", "Mana" }),  -- must be one of these
+        Scribe.Int(1, { Min = 1, Max = 10 }),          -- integer, 1–10
+    },
+}, function(player, flavour, count)
+    -- flavour is always "Health" or "Mana"; count is always 1–10
+end)
+```
+
+A declarator in `Args` brings its own constraints — `Min`, `Max`, `MaxLength`, enum members, and integrality for `Scribe.Int`. A bare `"number"` only checks the type; `count = 0`, `count = 2.5`, and `count = 1e9` all pass `"number"` and all fail `Scribe.Int(1, { Min = 1, Max = 10 })`.
+
+| Spec entry | Accepts |
+|---|---|
+| `"string"`, `"number"`, `"boolean"`, `"table"`, `"buffer"` | A value whose `typeof()` is exactly that |
+| `"any"` | Any value except `nil` |
+| Trailing `?`, as in `"string?"` | That type, or `nil`, including an omitted trailing argument |
+| `"any?"` | Anything at all, including `nil` |
+| A Scribe declarator | That type with all its constraints |
+| A shape table `{ Field = spec }` | A table with exactly those keys |
+
+<Warning>
+  A non-finite number argument (NaN, `inf`, `-inf`) is always refused, whatever the spec says — including `"any"`. No number Scribe can store is non-finite, so one is never a legitimate argument.
+</Warning>
+
+### Table Payloads
+
+A spec entry may be a shape table describing a table argument:
+
+```lua
+Data.Command("CraftItem", {
+    Args = { { ItemId = "string", Count = "number?", Reagents = { "string" } } },
+}, function(player, order)
+    -- order.ItemId: string
+    -- order.Count: number or nil
+    -- order.Reagents: array of strings
+end)
+```
+
+A shape **rejects undeclared keys** — a payload with extra fields is answered `bad-args`. A malformed spec is refused at registration rather than on the first call, so a shape that could never match fails at startup.
+
+## A Complete Buy-Item Example
+
+Here is a full command with a cost deduction and a Scribe inventory grant:
+
+<Tabs>
+  <Tab title="Server">
+    ```lua
+    -- ServerScriptService/ShopCommands
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local Data = require(ReplicatedStorage.Shared.GameData).Server
+
+    local ITEM_COSTS = {
+        HealthPotion = 50,
+        ManaPotion   = 75,
+    }
+
+    Data.Command("BuyItem", {
+        Args = {
+            Scribe.Enum("HealthPotion", { "HealthPotion", "ManaPotion" }),
+            Scribe.Int(1, { Min = 1, Max = 10 }),
+        },
+    }, function(player, itemId, qty)
+        local data = Data[player]
+        local cost = ITEM_COSTS[itemId] * qty
+
+        if data.Coins.Get() < cost then
+            return false, "not enough coins"
+        end
+
+        data.Coins.Decrement(cost)
+        local current = data.Inventory[itemId].Qty.Get() or 0
+        data.Inventory[itemId].Qty.Set(current + qty)
+
+        return true, cost
+    end)
+    ```
+  </Tab>
+  <Tab title="Client">
+    ```lua
+    -- StarterPlayerScripts/ShopClient
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local Scribe = require(ReplicatedStorage.Packages.Scribe)
+    local Data = require(ReplicatedStorage.Shared.GameData).Client
+
+    local function buyItem(itemId, qty)
+        local ok, detail, failed = Data.Request("BuyItem", itemId, qty)
+
+        if failed == Scribe.RequestFailed then
+            -- framework refused (rate limit, not ready, bad args, etc.)
+            warn("BuyItem was refused by Scribe:", detail)
+            return false
+        end
+
+        if not ok then
+            -- handler returned false — show the reason to the player
+            showToast("Purchase failed: " .. tostring(detail))
+            return false
+        end
+
+        -- ok is true, detail is the coin cost deducted
+        print("Bought", qty, itemId, "for", detail, "coins")
+        return true
+    end
+
+    buyButton.Activated:Connect(function()
+        buyItem("HealthPotion", 3)
+    end)
+    ```
+  </Tab>
+</Tabs>
+
+## Idempotent Commands with RequestOnce
+
+Some commands must not run twice however many times the client retries. Mark the command `Idempotent = true` on the server and call it with `Data.RequestOnce(name, key, ...)` from the client. The server runs the handler **at most once per key** and replays its original reply to every repeat.
+
+<Tabs>
+  <Tab title="Server">
+    ```lua
+    Data.Command("ClaimDaily", { Idempotent = true }, function(player)
+        local data = Data[player]
+        if data.LastDaily.Active() then
+            return false, "already claimed today"
+        end
+        data.LastDaily.SetTimed(true, 86400)  -- clears after 24 hours
+        data.Gems.Increment(100)
+        return true
+    end)
+    ```
+  </Tab>
+  <Tab title="Client">
+    ```lua
+    local HttpService = game:GetService("HttpService")
+    local Scribe = require(ReplicatedStorage.Packages.Scribe)
+
+    -- generate the key ONCE per intent, not per attempt
+    local claimId = HttpService:GenerateGUID(false)
+
+    local function claimDaily()
+        return Data.RequestOnce("ClaimDaily", claimId)
+    end
+
+    local ok, reason, failed = claimDaily()
+    if failed == Scribe.RequestFailed and reason == Scribe.RequestReason.Timeout then
+        -- timeout means the server may still be running the handler
+        -- retry with the SAME key — the server replays its first answer
+        ok, reason, failed = claimDaily()
+    end
+
+    if failed == Scribe.RequestFailed then
+        warn("ClaimDaily refused:", reason)
+    elseif ok then
+        print("Daily reward claimed!")
+    else
+        showToast(reason)  -- "already claimed today"
+    end
+    ```
+  </Tab>
+</Tabs>
+
+The requirement is symmetric and enforced: a key sent to a non-idempotent command, or a keyless `Request` to an idempotent one, is refused with `bad-idempotency-key`. Keys must be non-empty, valid UTF-8, and at most 64 bytes.
+
+## What the Caller Gets Back on Failure
+
+Every framework refusal resolves `Data.Request` as three values: `false`, a sentinel string, and `Scribe.RequestFailed`. Check the third value to distinguish a framework refusal from a handler result.
+
+```lua
+local ok, reason, failed = Data.Request("BuyPotion", "Health", 3)
+if failed == Scribe.RequestFailed then
+    warn("BuyPotion never ran:", reason)  -- one of the sentinels below
+elseif not ok then
+    showToast(reason)                     -- your handler's reason, safe to show
+end
+```
+
+| Sentinel | `Scribe.RequestReason` constant | Raised by | Meaning |
+|---|---|---|---|
+| `"rate-limited"` | `RateLimited` | Server | Player is over `CommandRateLimit`; handler never ran |
+| `"not-ready"` | `NotReady` | Server | Caller's profile is not `Ready` |
+| `"unknown-command"` | `UnknownCommand` | Server | No registration under that name |
+| `"bad-args"` | `BadArgs` | Server | Args did not match the spec, or too many arguments |
+| `"bad-idempotency-key"` | `BadIdempotencyKey` | Server | Key and command disagree, or key was malformed |
+| `"error"` | `Error` | Server | Handler threw; traceback goes to `COMMAND_ERROR` log, never to the client |
+| `"reply-encode-failed"` | `ReplyEncodeFailed` | Server | Handler succeeded but returned something the wire cannot carry |
+| `"timeout"` | `Timeout` | Client | No reply within `RequestTimeout` (default 10 seconds) |
+| `"send-failed"` | `SendFailed` | Client | Transport raised while sending the request |
+| `"edit-mode"` | `EditMode` | Client | `RunService:IsRunning()` is false and no mock registered |
+| `"mock-error"` | `MockError` | Client | Edit mode and the registered mock handler threw |
+
+<Warning>
+  A `timeout` means the handler **may still be running**. Its writes committed and will save normally. Never re-grant on timeout — use idempotent commands with `RequestOnce` for anything that must not run twice.
+</Warning>
+
+## Rate Limiting
+
+Each player gets a token bucket sized and refilled at `CommandRateLimit` per second, defaulting to 20. The bucket starts full, so a burst of up to the full allowance passes immediately.
+
+```lua
+Scribe({
+    Template = template,
+    ProfileStoreIndex = "PlayerData",
+    ProfileKeyPrefix = "PLAYER_",
+    CommandRateLimit = 10,  -- 10 commands per second sustained, burst up to 10
+})
+```
+
+A player over the limit receives `false, "rate-limited"` for each excess request. After 256 consecutive rate-limited frames with no 10-second quiet gap, the rejection reply is also suppressed so that caller waits out `RequestTimeout` — this stops a flood from generating its own outbound traffic.
+
+## Client.Request vs Client.RequestOnce
+
+| Method | When to use |
+|---|---|
+| `Data.Request(name, ...args)` | Any command that is safe to run more than once |
+| `Data.RequestOnce(name, key, ...args)` | Any command that must run at most once per intent |
+
+`Data.Request` waits for a reply and returns the handler's return values. `Data.RequestOnce` additionally tags the request with an idempotency key — generate the key once per intent, before the first attempt, and reuse the same key for every retry of that intent.
+
+## Edit-Mode Mocks
+
+When `RunService:IsRunning()` is false (in a storybook or the command bar), `Data.Request` looks for a mock registered with `Data.MockCommand`. Without one it returns `false, "edit-mode"`.
+
+```lua
+-- only runs in edit mode; errors in a real server
+Data.MockCommand("ToggleMusic", function(on)
+    return on
+end)
+```
+
+Mock handlers take only the arguments, with no leading `player`. `MockCommand` errors outside edit mode, so it cannot accidentally run in production.
+
+## Argument and Reply Limits
+
+<Accordion title="Limits at a glance">
+
+| Limit | Value | What happens when exceeded |
+|---|---|---|
+| Max arguments per call | 16 | `Data.Request` raises on the caller's thread |
+| Max reply values | 8 | Only first 8 sent; server warns `COMMAND_REPLY_TRUNCATED` |
+| Idempotency key max length | 64 bytes | `Data.RequestOnce` raises on the caller's thread |
+
+Arguments and return values are carried by Scribe's generic codec, which handles `nil`, booleans, numbers, strings, buffers, and nested tables up to 24 levels deep. Roblox datatypes (`Vector3`, `CFrame`, etc.) cannot cross the command boundary — pass their numeric components, or pack them into a plain table.
+
+</Accordion>
+
+## Where to Next
+
+<CardGroup cols={2}>
+  <Card title="Replication" icon="arrows-rotate" href="/guides/replication">
+    Why client writes stay local and why commands exist.
+  </Card>
+  <Card title="Lifecycle" icon="clock" href="/guides/lifecycle">
+    Session states and why handlers only run for Ready players.
+  </Card>
+  <Card title="Security" icon="shield" href="/guides/security">
+    What the server checks on every inbound frame.
+  </Card>
+  <Card title="Diagnostics" icon="chart-bar" href="/guides/diagnostics">
+    CommandsReceived, CommandErrors, and rate-limit counters.
+  </Card>
+</CardGroup>

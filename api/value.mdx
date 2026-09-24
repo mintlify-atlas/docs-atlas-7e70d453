@@ -1,0 +1,424 @@
+---
+title: "Value Accessor Methods in Scribe"
+sidebarTitle: "Value"
+description: "Reference for every method on a Scribe value node: reading, writing, observing, navigating, and container, flag, and timed operations."
+---
+
+Every field in your template becomes a **value node** — an object in the accessor tree with a consistent method surface. Whether you declared the field with `Scribe.Int`, `Scribe.ArrayOf`, or `Scribe.Flags`, the same core methods are always present. Specialized methods (arithmetic, container mutations, membership operations) are added on top based on the field's declared type.
+
+The accessor tree is reached through `Server.Get(player)` or `Server.WaitForData(player)` on the server, and through `Client.Get()` or directly as `Data.<fieldName>` on the client.
+
+```lua
+-- Reading and writing
+local coins = data.Coins.Get()           -- number
+data.Coins.Set(1000)
+data.Coins.Increment(50)
+
+-- Observing
+local disconnect = data.Coins.Observe(function(value)
+    coinsLabel.Text = tostring(value)    -- fires immediately, then on change
+end)
+
+-- Navigating
+local equipped = data.Inventory.Child("Emberblade")
+```
+
+---
+
+## Reading
+
+### `Value.Get()` → `T`
+
+Returns the current value. On the client, returns the template default until the first snapshot arrives.
+
+---
+
+### `Value.Clone()` → `T`
+
+Returns a deep copy of the current value. Use when you need a snapshot you can mutate without affecting the stored state.
+
+---
+
+### `Value.Default()` → `T`
+
+Returns the template default for this field — the value declared in the `Template` table.
+
+---
+
+### `Value.Min()` → `number?`
+
+Returns the declared lower bound, or `nil` if none was declared. Available on number and big-number fields.
+
+For `Scribe.Big` fields, the return type is `(number | string)?` because a bound past `1.8e308` is stored as a numeric string.
+
+---
+
+### `Value.Max()` → `number?`
+
+Returns the declared upper bound, or `nil` if none was declared.
+
+---
+
+## Writing
+
+### `Value.Set(value, silent?)` → `T`
+
+Sets the field to `value` and returns the new value after any clamping or rounding. If `silent` is `true`, `Changed` and `Observe` listeners are not fired for this write.
+
+<ParamField body="value" type="T" required>The new value. Must match the declared type.</ParamField>
+<ParamField body="silent" type="boolean">Suppress `Changed` and `Observe` for this write. Default `false`.</ParamField>
+
+---
+
+### `Value.Update(fn, silent?)` → `T`
+
+Passes the current value to `fn` and sets the result.
+
+```lua
+data.Username.Update(function(current)
+    return current:sub(1, 20)
+end)
+```
+
+<ParamField body="fn" type="(current: T) -> T" required>Receives the current value; its return becomes the new value.</ParamField>
+<ParamField body="silent" type="boolean">Suppress change notifications.</ParamField>
+
+---
+
+## Observing
+
+### `Value.Observe(callback)` → `Disconnect`
+
+Calls `callback` immediately with the current value, and again whenever the field changes. Returns a function to disconnect the listener.
+
+```lua
+local disconnect = data.Coins.Observe(function(coins)
+    coinsLabel.Text = Scribe.Short(coins)
+end)
+-- call disconnect() when the UI is destroyed
+```
+
+<ParamField body="callback" type="(value: T) -> ()" required>Fires immediately and on each change.</ParamField>
+<ResponseField name="Disconnect" type="() -> ()">Call to remove this listener.</ResponseField>
+
+---
+
+### `Value.Changed(callback)` → `Disconnect`
+
+Like `Observe`, but fires only on change — not on the initial call.
+
+<ParamField body="callback" type="(new: T, old: T) -> ()" required>Receives the new and old value.</ParamField>
+
+---
+
+### `Value.OnChildChanged(callback)` → `Disconnect`
+
+For tables, arrays, dictionaries, and maps: fires once per child write, never coalesced, unlike `Changed` which fires once per batch. Use this to learn which child moved.
+
+```lua
+data.Stats.OnChildChanged(function(key, new, old)
+    print(key, "changed from", old, "to", new)
+end)
+```
+
+<ParamField body="callback" type="(key: string | number, new: T?, old: T?) -> ()" required>
+  `key` is the child field name or array index. `new` and `old` are optional: an added key has no old value, a removed key has no new.
+</ParamField>
+
+---
+
+## Navigating
+
+### `Value.Child(key)` → `ValueNode`
+
+Accesses a child node by key. Used when a field name collides with a method name (e.g. a field literally named `"Get"`) and direct property access would shadow the method.
+
+```lua
+data.Inventory.Child("Emberblade").Count.Get()
+```
+
+<ParamField body="key" type="string | number" required>The child field name or array index.</ParamField>
+
+---
+
+## Numbers
+
+Number methods are available on fields declared with `Scribe.Int` or `Scribe.Number`.
+
+### `Value.Increment(n, tag?)` → `number`
+
+Adds `n` to the current value. Returns the new value after clamping. If `tag` is an `EconomyMeta` table, emits a `LogEconomyEvent` automatically.
+
+```lua
+data.Coins.Increment(100)
+data.Coins.Increment(100, { Flow = "Source", TransactionType = "Gameplay" })
+```
+
+<ParamField body="n" type="number" required>Amount to add. Must be positive.</ParamField>
+<ParamField body="tag" type="EconomyMeta?">Optional analytics tag. See [`EconomyMeta`](/api/types#economymeta).</ParamField>
+
+---
+
+### `Value.Decrement(n, tag?)` → `number`
+
+Subtracts `n` from the current value. Returns the new value after clamping.
+
+<ParamField body="n" type="number" required>Amount to subtract. Must be positive.</ParamField>
+<ParamField body="tag" type="EconomyMeta?">Optional analytics tag.</ParamField>
+
+---
+
+## Booleans
+
+Boolean methods are available on fields declared with `Scribe.Bool` or plain `true`/`false`.
+
+### `Value.Toggle(silent?)` → `boolean`
+
+Flips the boolean and returns the new value.
+
+<ParamField body="silent" type="boolean">Suppress change notifications.</ParamField>
+
+---
+
+## Big Numbers
+
+`Scribe.Big` fields expose all standard number methods (`Increment`, `Decrement`, `Min`, `Max`) plus the following.
+
+### `Value.Multiply(operand, silent?)` → `BigValue`
+
+Multiplies the current value by `operand`. Returns the new `BigValue`.
+
+<ParamField body="operand" type="number | string | BigValue" required></ParamField>
+
+---
+
+### `Value.Divide(operand, silent?)` → `BigValue`
+
+Divides the current value by `operand`. Returns the new `BigValue`.
+
+---
+
+For `Scribe.Big` fields, `Set` and `Update` also accept `number | string | BigValue` in addition to the plain `BigValue` type. The `Get()` return type is a [`BigValue`](/api/types#bigvalue) object with arithmetic methods (`:Add()`, `:Subtract()`, `:Compare()`, `:Short()`, `:ToNumber()`, etc.).
+
+---
+
+## Arrays (`Scribe.ArrayOf`)
+
+Array methods are available on fields declared with `Scribe.ArrayOf`.
+
+### `Value.Insert(element, index?, silent?)`
+
+Inserts `element` at `index` (default: end). Fires `OnInsert`. Respects `MaxItems` and `Evict`.
+
+<ParamField body="element" type="T" required>Must match the declared element schema.</ParamField>
+<ParamField body="index" type="number">Insertion position. Defaults to the end.</ParamField>
+<ParamField body="silent" type="boolean">Suppress notifications.</ParamField>
+
+---
+
+### `Value.Remove(index?, silent?)` → `T?`
+
+Removes and returns the element at `index` (default: last). Returns `nil` on an empty array.
+
+---
+
+### `Value.RemoveValue(element, silent?)` → `(T?, number?)`
+
+Finds and removes the first occurrence of `element` by value comparison. Returns the removed element and its former index, or `(nil, nil)` if not found.
+
+---
+
+### `Value.Find(element)` → `number?`
+
+Returns the index of `element` by value comparison, or `nil` if absent.
+
+---
+
+### `Value.Has(element)` → `boolean`
+
+Returns whether `element` is in the array.
+
+---
+
+### `Value.Count()` → `number`
+
+Returns the number of elements.
+
+---
+
+### `Value.Clear(silent?)`
+
+Removes all elements and fires `Changed`.
+
+---
+
+### `Value.OnInsert(callback)` → `Disconnect`
+
+Fires with `(element, index)` whenever an element is inserted.
+
+<ParamField body="callback" type="(element: T, index: number) -> ()" required></ParamField>
+
+---
+
+### `Value.OnRemove(callback)` → `Disconnect`
+
+Fires with `(element, index)` whenever an element is removed.
+
+---
+
+## Dictionaries and Maps
+
+Dictionary methods are available on fields declared with `Scribe.DictOf` or `Scribe.MapOf`. Dictionary children are themselves value nodes, so `data.Inventory["Emberblade"].Count.Increment(1)` is the standard pattern.
+
+### `Value.Remove(key, silent?)` → `T?`
+
+Removes and returns the value at `key`. Returns `nil` if the key did not exist.
+
+<ParamField body="key" type="string | K" required>For `DictOf`: a string. For `MapOf`: the declared key type.</ParamField>
+
+---
+
+### `Value.Count()` → `number`
+
+Returns the number of keys currently present.
+
+---
+
+### `Value.Clear(silent?)`
+
+Removes all keys.
+
+---
+
+### `Value.OnKeyAdded(callback)` → `Disconnect`
+
+Fires with `(key, value)` when a new key is written.
+
+<ParamField body="callback" type="(key: K, value: V) -> ()" required></ParamField>
+
+---
+
+### `Value.OnKeyRemoved(callback)` → `Disconnect`
+
+Fires with `(key, value)` when a key is removed.
+
+---
+
+## Sets (`Scribe.SetOf`)
+
+Set methods are available on fields declared with `Scribe.SetOf`.
+
+### `Value.Add(element, silent?)` → `boolean`
+
+Adds `element` to the set. Returns `true` if it was not already a member (i.e. the set changed). An `Add` of an already-present value writes nothing and fires no `Changed`.
+
+<ParamField body="element" type="T" required>Must match the declared element type.</ParamField>
+<ParamField body="silent" type="boolean"></ParamField>
+
+---
+
+### `Value.Remove(element, silent?)` → `boolean`
+
+Removes `element` from the set. Returns `true` if it was a member. A `Remove` of an absent value writes nothing.
+
+---
+
+### `Value.Has(element)` → `boolean`
+
+Returns whether `element` is currently in the set.
+
+---
+
+### `Value.Count()` → `number`
+
+Returns the number of members.
+
+---
+
+### `Value.Clear(silent?)`
+
+Removes all members.
+
+---
+
+## Flags (`Scribe.Flags`)
+
+Flag methods are available on fields declared with `Scribe.Flags`. Members are addressed by name, not by index.
+
+### `Value.Enable(member, silent?)`
+
+Enables the named member. Enabling an already-enabled member writes nothing.
+
+<ParamField body="member" type="string" required>Must be a declared member name.</ParamField>
+
+---
+
+### `Value.Disable(member, silent?)`
+
+Disables the named member.
+
+---
+
+### `Value.Has(member)` → `boolean`
+
+Returns whether the named member is currently enabled.
+
+---
+
+### `Value.Toggle(member, silent?)` → `boolean`
+
+Flips the named member and returns the new state.
+
+---
+
+### `Value.Count()` → `number`
+
+Returns the number of currently enabled members.
+
+---
+
+### `Value.Clear(silent?)`
+
+Disables all members.
+
+---
+
+## Timed Fields (`Scribe.Timed`)
+
+Timed methods are available on fields declared with `Scribe.Timed`. These are **server-only** — calling `SetTimed` or `ExtendTimed` from a `LocalScript` raises an error.
+
+### `Value.SetTimed(value, duration, silent?)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Sets the field to `value` and starts a timer for `duration` seconds. When the timer lapses, the field resets to its declared default and fires `Changed`.
+
+```lua
+data.ActiveBoost.SetTimed("DoubleXP", 3600)   -- expires in 1 hour
+```
+
+<ParamField body="value" type="T" required>The value to hold while the timer is active.</ParamField>
+<ParamField body="duration" type="number" required>Seconds until auto-clear.</ParamField>
+<ParamField body="silent" type="boolean">Suppress the Set notification (the expiry always fires).</ParamField>
+
+---
+
+### `Value.ExtendTimed(duration, silent?)` <span style={{fontSize:"0.75rem", background:"#2563eb", color:"white", borderRadius:"4px", padding:"2px 6px", marginLeft:"8px"}}>server</span>
+
+Adds `duration` seconds to the current expiry. Has no effect if the timer is not active.
+
+<ParamField body="duration" type="number" required>Seconds to add.</ParamField>
+
+---
+
+### `Value.Active()` → `(boolean, number?)`
+
+Returns whether the timer is currently active and the remaining seconds until expiry. Both the server and the client can call this.
+
+```lua
+local active, remaining = data.ActiveBoost.Active()
+if active then
+    boostLabel.Text = "Boost: " .. math.floor(remaining) .. "s"
+end
+```
+
+<ResponseField name="active" type="boolean">`true` while the timer is running.</ResponseField>
+<ResponseField name="remaining" type="number?">Seconds remaining, or `nil` when inactive.</ResponseField>

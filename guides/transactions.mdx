@@ -1,0 +1,235 @@
+---
+title: "Atomic Transactions and Safe Data Operations"
+sidebarTitle: "Transactions"
+description: "Use Transaction for all-or-nothing writes, Batch for coalesced replication, and Flush for save confirmation — with worked examples for coins, inventory, and cross-player gifts."
+---
+
+When a shop needs to take payment and grant an item at the same time, a single write failure must not leave the player with neither their coins nor their item. Scribe's `Transaction` API makes that guarantee: if anything inside the callback throws, every write in that callback is rolled back as if it never happened.
+
+## Transaction — all-or-nothing writes
+
+`Data.Transaction(player, fn)` runs `fn` atomically on one player's data. If `fn` throws, every write inside is rolled back and `(false, error)` is returned. On success it returns `(true, nil)`.
+
+```lua
+local Data = require(ReplicatedStorage.Shared.EmberfallData).Server
+
+local function forge(player: Player): ("Saved" | "Pending" | "Refused", string?)
+    local data = Data[player]
+
+    local ok, err = Data.Transaction(player, function()
+        if data.Coins.Get() < 250 then
+            error("not enough coins")
+        end
+        data.Coins.Decrement(250)
+        data.Xp.Increment(200)
+        data.Inventory["Emberblade"].Update(function(entry)
+            local qty = if entry then entry.Qty else 0
+            if qty >= 999 then
+                error("Emberblade stack is full")
+            end
+            return { Qty = qty + 1, Rarity = "Rare" }
+        end)
+    end)
+
+    if not ok then
+        return "Refused", err  -- coins are untouched; nothing changed
+    end
+
+    if not Data.Flush(player) then
+        return "Pending", "The forge applied but saving is not yet confirmed"
+    end
+    return "Saved"
+end
+```
+
+If the `Emberblade` stack is already at 999, the `error(...)` call inside the callback rolls back both the `Decrement(250)` and the `Increment(200)` — the player keeps their coins.
+
+<Warning>
+The callback **must not yield**. No `task.wait`, no DataStore calls, no network requests inside a Transaction. A yield is refused with `(false, error)` and all writes are rolled back. Async work belongs before or after the transaction, never inside it.
+</Warning>
+
+### What the return values mean
+
+| Result | Meaning | What to do |
+| --- | --- | --- |
+| `(true, nil)` | All writes applied in memory. | Pair with `Flush` to confirm the save. |
+| `(false, reason)` | The callback threw or yielded; nothing changed. | Surface the reason; do not retry automatically. |
+
+### Transaction is atomic in memory, not on the DataStore
+
+`Transaction` returning `true` means the writes landed on the player's in-memory tree together. They still queue for the next DataStore save. Pair `Transaction` with `Flush` when you need durable confirmation before acknowledging the operation.
+
+## Flush — waiting for save confirmation
+
+`Data.Flush(player, opts?)` waits for the player's pending changes to be saved and returns `true` when confirmed.
+
+```lua
+local saved = Data.Flush(player)
+if not saved then
+    -- The operation applied but saving is still in flight.
+    -- Do NOT repeat the purchase or undo the grant.
+    -- Retry Flush while the session is still Ready.
+    warn("Save not confirmed; retry Flush")
+end
+```
+
+<Warning>
+A `false` return from `Flush` means **unresolved**, not failed. The save may still complete after `Flush` returns. Never undo or repeat an operation because its flush timed out — always retry `Flush` instead.
+</Warning>
+
+### FlushOptions
+
+<ParamField body="Timeout" type="number">
+  How many seconds to wait for save confirmation. Defaults to 15. Raising this gives the DataStore more time, but does not extend the actual save deadline.
+</ParamField>
+
+<ParamField body="Force" type="boolean">
+  Always request a new save, bypassing the "already saved" shortcut and any blocked wipe guard. Reserve for deliberate recovery operations, not routine grants.
+</ParamField>
+
+### When Flush is free
+
+If the profile is clean — nothing written since the last save, no save in flight, and the last save succeeded — `Flush` returns `true` immediately with no DataStore request. This is never the case right after a grant, since every grant marks the profile dirty.
+
+## GetSaveInfo — inspecting save state
+
+`Data.GetSaveInfo(player)` returns the player's current save metadata:
+
+```lua
+local info = Data.GetSaveInfo(player)
+-- info.Dirty:       boolean  -- true if there are unsaved writes
+-- info.LastSaveAt:  number?  -- os.time() of the last successful save
+-- info.LastResult:  "Ok" | "Fail" | nil
+-- info.Size:        number?  -- approx bytes of the last save (nil before first save)
+```
+
+Use this for "Saving… / Saved ✓ / Unsaved changes" UI indicators. `Size` is useful for spotting a profile approaching the ~4 MB DataStore ceiling.
+
+## Batch — coalesced replication without rollback
+
+`Data.Batch(player, fn)` groups multiple writes into a single replication flush and fires each container's `Changed` signal once, rather than once per write. It does **not** roll back on failure — earlier writes stay applied if a later one throws.
+
+```lua
+-- Respawn: two stats move, the client redraws once
+Data.Batch(player, function()
+    local data = Data[player]
+    data.Stats.Deaths.Increment(1)
+    data.Stats.Playtime.Increment(60)
+end)
+```
+
+### Transaction vs Batch
+
+| | `Batch` | `Transaction` |
+| --- | --- | --- |
+| Coalesces replication | yes | yes |
+| Rolls back on error | **no** | **yes** |
+| Return value | none | `(boolean, string?)` |
+| May yield inside | yes | **no** |
+
+Use `Transaction` when all changes must succeed together. Use `Batch` purely to reduce the number of replication frames and `Changed` notifications. Wrapping a `Transaction` in a `Batch` is unnecessary — transactions already coalesce their writes.
+
+## Cross-player value: the durable outbox pattern
+
+Scribe transactions cover **one player's data only**. Writing to a different player's tree inside a `Transaction` fails the outer transaction and rolls everything back. There is no cross-player or cross-key transaction.
+
+For one-sided value transfers (coins sent as a gift, quest rewards delivered to another player), use the **durable outbox** pattern:
+
+<Steps>
+  <Step title="Debit and record in one transaction">
+    Remove the coins from the sender and save a pending-transfer record in the same atomic write.
+  </Step>
+  <Step title="Flush the sender">
+    Confirm the save before sending anything. This proves the debit and record are durable.
+  </Step>
+  <Step title="Send a message">
+    Deliver the transfer ID and amount to the recipient via `Data.SendMessage`. The same transfer ID is used on every retry — never create a new debit for the same intent.
+  </Step>
+  <Step title="Credit and mark in one transaction on the recipient">
+    When the recipient's `OnMessage` fires, credit the coins and save the transfer ID together in a single transaction. On a duplicate delivery, the saved ID prevents a double-credit.
+  </Step>
+</Steps>
+
+```lua
+-- Sender side: debit + record
+local HttpService = game:GetService("HttpService")
+local transferId = HttpService:GenerateGUID(false)
+
+local ok, reason = Data.Transaction(sender, function()
+    local data = Data[sender]
+    if data.Coins.Get() < amount then
+        error("not enough coins")
+    end
+    data.Coins.Decrement(amount)
+    data.Outbox[transferId].Set({
+        ToUserId = recipientId,
+        Coins    = amount,
+        SentAt   = os.time(),
+    })
+end)
+
+if not ok then
+    return false, reason -- nothing changed
+end
+
+-- Flush before sending
+if not Data.Flush(sender) then
+    return false, "save not confirmed; retry delivery later"
+end
+
+-- Send the message
+Data.SendMessage(recipientId, {
+    Kind = "CoinGift",
+    Id   = transferId,
+    Coins = amount,
+})
+```
+
+```lua
+-- Recipient side: credit + mark
+Data.OnMessage:Connect(function(recipient, message)
+    if message.Kind ~= "CoinGift" then return end
+
+    local ok, reason = Data.Transaction(recipient, function()
+        local data = Data[recipient]
+        if data.Credited[message.Id].Get() ~= nil then
+            return -- already applied; ignore duplicate
+        end
+        data.Coins.Increment(message.Coins)
+        data.Credited[message.Id].Set(os.time())
+    end)
+
+    if not ok then
+        error(reason or "could not apply coin gift") -- keeps the message for retry
+    end
+end)
+```
+
+<Warning>
+Never yield inside an `OnMessage` handler. Do not call `Flush` inside it either — Scribe removes the message only after the handler returns successfully, in the same save that persists its writes.
+</Warning>
+
+## For two-sided trades
+
+When both players must give and receive atomically, use [Exchange](/guides/exchange) — Scribe's built-in same-server trade system that places both baskets in escrow before deciding the outcome.
+
+<Warning>
+There is no cross-server trade API in Scribe. A trade spanning two servers requires saved commitments, shared decisions, and duplicate-safe delivery on both sides. See the [Exchange guide](/guides/exchange) for the constraints and what Scribe can help with.
+</Warning>
+
+## Where to next
+
+<CardGroup cols={2}>
+  <Card title="Exchange" href="/guides/exchange">
+    Atomic two-sided trades between players on the same server.
+  </Card>
+  <Card title="Gifting" href="/guides/gifting">
+    Scribe's built-in product gifting flow with offline delivery.
+  </Card>
+  <Card title="Lifecycle" href="/guides/lifecycle">
+    Session loading, saving, shutdown behavior, and Flush in detail.
+  </Card>
+  <Card title="Monetization" href="/guides/monetization">
+    Soft-currency purchases with Purchase and PurchaseSpec.
+  </Card>
+</CardGroup>

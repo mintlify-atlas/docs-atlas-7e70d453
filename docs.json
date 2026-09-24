@@ -1,72 +1,86 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "Scribe",
+  "theme": "luma",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
-  },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": [
-      {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+    "primary": "#5B6AD0",
+    "light": "#EEF0FC",
+    "dark": "#1A1D3A"
   },
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/ericplane/scribe"
     }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/ericplane/scribe"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Guides",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "guides/introduction",
+              "guides/quickstart",
+              "guides/installation",
+              "guides/templates"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "guides/values",
+              "guides/containers",
+              "guides/lifecycle",
+              "guides/replication",
+              "guides/commands"
+            ]
+          },
+          {
+            "group": "Features",
+            "pages": [
+              "guides/monetization",
+              "guides/leaderboards",
+              "guides/transactions",
+              "guides/gifting",
+              "guides/exchange",
+              "guides/migrations"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "guides/diagnostics",
+              "guides/security",
+              "guides/server-store",
+              "guides/addons",
+              "guides/roblox-ts"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "API",
+            "pages": [
+              "api/overview",
+              "api/scribe",
+              "api/server",
+              "api/client",
+              "api/value",
+              "api/types"
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

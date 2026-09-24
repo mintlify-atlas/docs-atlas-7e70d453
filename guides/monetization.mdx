@@ -1,0 +1,340 @@
+---
+title: "Monetization: Products, Passes, and Purchases"
+sidebarTitle: "Monetization"
+description: "Sell developer products and game passes, spend soft currency, check ownership, and manage perks — all with Scribe's atomic, fail-closed purchase pipeline."
+---
+
+Scribe integrates directly with Roblox's monetization layer so that every Robux transaction is durable, deduplicated, and fail-closed by default. Whether you are selling coin packs, granting a VIP pass perk, or running a soft-currency shop, all writes go through the same atomic pipeline — a grant that throws leaves the player's balance completely unchanged.
+
+## Declaring products and passes
+
+Define your products and passes in the shared module alongside your template. Each `Product` entry carries a numeric `Id`, an optional `Category`, a `Grant` callback that receives the buyer's accessor tree, an optional `Grants` perk name, and an optional `PaidRandom` flag for loot boxes.
+
+```lua
+local template = { --[[ ... ]] }
+
+return Scribe({
+    Template = template,
+    ProfileStoreIndex = "EmberfallData",
+    ProfileKeyPrefix = "PLAYER_",
+
+    Products = {
+        CoinPack500 = {
+            Id = 1234567890,
+            Category = "Currency",
+            Grant = function(data)
+                data.Coins.Increment(500, {
+                    TransactionType = Enum.AnalyticsEconomyTransactionType.IAP,
+                    ItemSku = "CoinPack500",
+                })
+            end,
+        },
+        GemPack100 = {
+            Id = 9876543210,
+            Category = "Currency",
+            Grants = "GemPackBuyer", -- perk name: owned after first purchase
+        },
+        LootBox = {
+            Id = 1111111111,
+            PaidRandom = true, -- restricted for some players by policy
+            Grant = function(data)
+                data.Boxes.Increment(1)
+            end,
+        },
+    },
+
+    Passes = {
+        VIP = { Id = 987654321, Category = "Access" },
+    },
+
+    Perks = { "GemPackBuyer", "VIP" }, -- optional: enables typo guard
+})
+```
+
+When a server script first requires this module, Scribe binds `MarketplaceService.ProcessReceipt`. On a completed purchase it grants the product, writes a Robux purchase-log entry, and waits for the save before answering `PurchaseGranted`. If it cannot finish, it answers `NotProcessedYet` and leaves the receipt pending for Roblox to retry on the buyer's next session.
+
+<Warning>
+A `Grant` callback **must never yield**. No `task.wait`, no DataStore calls, no `MarketplaceService` calls inside it. Scribe runs the callback inside a transaction so that a partial grant is rolled back completely — but a transaction cannot survive a yield. Keep any async work outside the callback.
+</Warning>
+
+## Prompting a purchase
+
+Call `PromptPurchase` by the name you declared, not by the numeric `Id`. From a server script, pass the player:
+
+```lua
+local Data = require(ReplicatedStorage.Shared.EmberfallData).Server
+
+-- A server-side prompt — also works from client via Data.PromptPurchase("CoinPack500")
+local ok, reason = Data.PromptPurchase(player, "CoinPack500")
+if not ok then
+    warn(`Purchase refused: {reason}`)
+end
+```
+
+From a client LocalScript, omit the player argument — the client sends a request to the server:
+
+```lua
+local Scribe = require(ReplicatedStorage.Packages.Scribe)
+local Data = require(ReplicatedStorage.Shared.EmberfallData).Client
+
+buyButton.Activated:Connect(function()
+    local prompted, reason, requestFailed = Data.PromptPurchase("CoinPack500")
+    if requestFailed == Scribe.RequestFailed then
+        warn(`Request failed: {reason}`) -- e.g. "timeout", "rate-limited"
+    elseif not prompted then
+        warn(`Refused: {reason}`) -- e.g. "owned", "policy-pending"
+    end
+end)
+```
+
+`PromptPurchase` resolves the name against both `Products` and `Passes` and calls the appropriate engine method. It **refuses a product the player already owns**, so you do not need a manual ownership check before every prompt. A `true` return means the Roblox dialog was shown — not that a purchase completed. Grants always happen on the receipt path.
+
+### Checking product state before prompting
+
+`GetProductState` returns what `PromptPurchase` would refuse with, so your shop buttons can grey themselves out accurately:
+
+```lua
+local state = Data.GetProductState(player, "LootBox")
+-- state is one of: "purchasable", "owned", "paid-random-restricted", "policy-pending", "not-loaded"
+
+if state == Scribe.ProductState.Purchasable then
+    enableBuyButton()
+end
+```
+
+<Tabs>
+  <Tab title="Server">
+    ```lua
+    local state = Data.GetProductState(player, "LootBox")
+    if state == "paid-random-restricted" then
+        warn("Player cannot buy paid random items")
+    end
+    ```
+  </Tab>
+  <Tab title="Client">
+    ```lua
+    -- Observe state changes reactively (e.g. when policy loads or ownership changes)
+    local disconnect = Data.ObserveProductState("LootBox", function(state)
+        buyButton.Active = state == Scribe.ProductState.Purchasable
+        buyButton.Text = if state == "paid-random-restricted"
+            then "Not available"
+            else "Buy"
+    end)
+    ```
+  </Tab>
+</Tabs>
+
+## Paid random items
+
+Roblox requires a policy check before selling loot boxes or any item whose outcome is random and purchased with Robux (or with a currency Robux can buy). Declare `PaidRandom = true` on those entries and Scribe handles the rest:
+
+```lua
+Products = {
+    LootBox = {
+        Id = 1111111111,
+        PaidRandom = true,
+        Grant = function(data)
+            data.Boxes.Increment(1)
+        end,
+    },
+},
+```
+
+Scribe reads the player's policy once on join and refuses `PromptPurchase`, `PromptGift`, and `Purchase` for a restricted player or while the policy is not yet known. A receipt that arrives from a restricted player is still granted (the player has already paid) and logged as `PAID_RANDOM_RECEIPT`.
+
+<Note>
+A `Pass` entry cannot carry `PaidRandom = true`. Passes grant a fixed perk, not a random one, and declaring the flag on a pass is a startup error.
+</Note>
+
+## Perks, GrantPerk, and RevokePerk
+
+A perk is a saved boolean attached to a player. Products set one via `Grants`, and you can grant or revoke one directly for contest prizes, refunds, or admin commands:
+
+```lua
+Data.GrantPerk(player, "VIP")      -- Owns(player, "VIP") is now true
+Data.RevokePerk(player, "VIP")
+```
+
+Declaring your perk names in the top-level `Perks` list is optional but enables a startup typo guard:
+
+```lua
+Perks = { "VIP", "GemPackBuyer" },
+```
+
+With the list in place, Scribe logs `UNDECLARED_PERK` for any name used with `Grants` that is not listed, catching misspellings before they silently fail for paying players.
+
+### Checking ownership
+
+Use `OwnsAsync` as the default — it verifies live with `UserOwnsGamePassAsync` if the cache does not already say owned, so a pass bought moments ago is reflected immediately:
+
+```lua
+-- Server: authoritative ownership check
+if Data.OwnsAsync(player, "VIP") then
+    giveVipKit(player)
+end
+
+-- "RobloxPlus" is built in and never needs to be declared
+if Data.OwnsAsync(player, "RobloxPlus") then
+    Data[player].Coins.Increment(100)
+end
+```
+
+`Data.Owns` is the non-yielding version for hot paths where the data is already warm. React to ownership changes without polling using `OnOwnershipChanged`:
+
+```lua
+Data.OnOwnershipChanged:Connect(function(player, key, owned)
+    if key == "VIP" and owned then
+        openVipDoor(player)
+    end
+end)
+```
+
+<Warning>
+Gate all ownership grants on the **server's** check. The client's `Owns` and `OwnsAsync` read a replicated mirror that an exploiter can manipulate.
+</Warning>
+
+## Soft-currency purchases
+
+`Server.Purchase` is the shop-side counterpart to a Robux product. It debits a currency field, runs a grant, and writes a log entry — all or nothing. A `Grant` that throws rolls the debit back completely.
+
+```lua
+local ok, reason = Data.Purchase(player, {
+    Cost = { Path = "Coins", Amount = 250 },
+    Category = "Item",
+    ItemId = "EmberLantern",
+    Grant = function(data)
+        data.Inventory.EmberLantern.Update(function(entry)
+            local qty = if entry then entry.Qty else 0
+            if qty >= 999 then
+                error("Lantern stack is full")
+            end
+            return { Qty = qty + 1, Rarity = "Rare" }
+        end)
+    end,
+})
+
+if not ok then
+    if reason == Scribe.PurchaseReason.InsufficientFunds then
+        showToast(player, "You need 250 coins.")
+    elseif reason == Scribe.PurchaseReason.DataNotLoaded then
+        showToast(player, "Still loading — try again shortly.")
+    else
+        warn(`Shop refused: {reason}`)
+    end
+    return
+end
+```
+
+`Cost.Path` names any numeric field in your template (e.g. `"Coins"` or `"Wallet.Gold"`). The field's declarator enforces its own rules — a `Scribe.Int` with `Min = 0` means the balance can never go negative.
+
+### PurchaseSpec fields
+
+<ParamField body="Cost" type="{ Path: string, Amount: number }" required>
+  Which field to debit and how much. `Path` is a dotted path into the template. `Amount` must be a positive finite number matching the field's declared type rules.
+</ParamField>
+
+<ParamField body="ItemId" type="string" required>
+  Identifier written to the purchase log entry.
+</ParamField>
+
+<ParamField body="Category" type="string">
+  Purchase category written to the log. Logs `UNDECLARED_CATEGORY` in DevMode if not in `PurchaseLog.PurchaseLogCategories`.
+</ParamField>
+
+<ParamField body="Grant" type="(data) -> ()">
+  Callback that performs the actual grant. Must not yield. If it throws, the debit is rolled back.
+</ParamField>
+
+<ParamField body="Meta" type="{ [string]: any }">
+  Arbitrary metadata stored with the log entry.
+</ParamField>
+
+<ParamField body="IdempotencyKey" type="string">
+  Up to 64 bytes of UTF-8. A repeat call with the same key returns the original outcome and spends nothing — safe against double-clicks or reconnecting clients.
+</ParamField>
+
+<ParamField body="PaidRandom" type="boolean">
+  Mark this soft-currency purchase as a paid random item. Refused for a player whose policy restricts it.
+</ParamField>
+
+### PurchaseReason refusals
+
+<ResponseField name="InsufficientFunds" type="string">
+  The player's balance is too low. Show a "not enough coins" message.
+</ResponseField>
+
+<ResponseField name="DataNotLoaded" type="string">
+  The player's profile is not Ready. Show a "try again" message.
+</ResponseField>
+
+<ResponseField name="PaidRandomRestricted" type="string">
+  The player's account policy restricts paid random items.
+</ResponseField>
+
+<ResponseField name="PolicyPending" type="string">
+  The policy check is still in flight. Retry in a moment.
+</ResponseField>
+
+<ResponseField name="InvalidCostPath" type="string">
+  The `Cost.Path` does not resolve to a field in the template. A developer error — log it.
+</ResponseField>
+
+<ResponseField name="CostPathNotSpendable" type="string">
+  The path resolves to a field that cannot be spent from (e.g. a `Scribe.Big`, a string). A developer error — log it.
+</ResponseField>
+
+<Note>
+A grant that writes through an unresolved container key (e.g. `data.Inventory[itemId]` where `itemId` does not exist) succeeds end-to-end — the key is created with defaults. Validate item ids inside the `Grant` with `Get()` before writing, and throw if the item is missing.
+</Note>
+
+## HandleReceipt and TryHandleReceipt
+
+Scribe binds `MarketplaceService.ProcessReceipt` automatically unless you set `OwnReceipts = false`. If you keep your own handler, route Scribe products through `TryHandleReceipt`:
+
+```lua
+MarketplaceService.ProcessReceipt = function(receiptInfo)
+    local decision = Data.TryHandleReceipt(receiptInfo)
+    if decision then
+        return decision -- Scribe product; already granted and saved
+    end
+    return myOwnHandler(receiptInfo)
+end
+```
+
+`TryHandleReceipt` returns `nil` for a product Scribe does not know, so your own handler still runs. `HandleReceipt` (the strict variant) returns `NotProcessedYet` for unknown products instead — correct when Scribe owns the callback exclusively, but will stall your own products in a permanent retry loop if used in a shared chain.
+
+## Reading purchase history
+
+Every player carries two capped logs — `Robux` (written only by Scribe from receipts and confirmed pass purchases) and `InGame` (written by `Purchase` and `RecordPurchase`). Read them with `GetPurchases`, newest first:
+
+```lua
+for _, record in Data.GetPurchases(player, {
+    Kind = "Robux",
+    Limit = 10,
+}) do
+    print(record.Ts, record.Product, record.PriceInRobux)
+end
+```
+
+The `PurchaseFilter` type accepts `Kind`, `Category`, `ItemId`, `Since`, and `Limit`. Replicate either log to the client by setting `ReplicateRobux = true` or `ReplicateInGame = true` in `PurchaseLog`.
+
+<Tip>
+Use `Data.RecordPurchase(player, entry)` to append your own entries for quest rewards, trade completions, or any exchange Scribe did not process automatically.
+</Tip>
+
+## Where to next
+
+<CardGroup cols={2}>
+  <Card title="Gifting" href="/guides/gifting">
+    Send a product to another player, including one who is offline.
+  </Card>
+  <Card title="Transactions" href="/guides/transactions">
+    Atomic multi-field operations and safe soft-currency flows.
+  </Card>
+  <Card title="Leaderboards" href="/guides/leaderboards">
+    Rank players by any numeric stat across all servers.
+  </Card>
+  <Card title="API: Server" href="/api/server">
+    Full reference for every server-side method.
+  </Card>
+</CardGroup>

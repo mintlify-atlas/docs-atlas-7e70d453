@@ -1,0 +1,81 @@
+---
+title: "Scribe API Reference Overview"
+sidebarTitle: "Overview"
+description: "A reading guide to the Scribe API reference: which module to use, what the badges mean, and how to read type signatures."
+---
+
+The Scribe API is split across five modules. Each one owns a distinct responsibility — template declaration, server-side data management, client-side data access, per-field value methods, and types. This page explains how the reference is organized and what to look for before you follow a link to a specific method.
+
+## Which module do I need?
+
+<CardGroup cols={2}>
+  <Card title="Scribe" icon="cube" href="/api/scribe">
+    Construct a data bundle, declare field types, configure the library, and access diagnostics. Everything you write in your shared data module lives here.
+  </Card>
+  <Card title="Server" icon="server" href="/api/server">
+    Load and save player profiles, register commands, run purchases and leaderboard queries, manage exchanges, and listen to server-side signals.
+  </Card>
+  <Card title="Client" icon="monitor" href="/api/client">
+    Wait for the first data snapshot, send requests, read leaderboard and service-status mirrors, prompt purchases, and mock data in storybooks.
+  </Card>
+  <Card title="Value" icon="brackets-curly" href="/api/value">
+    Methods available on every field in the accessor tree — `Get`, `Set`, `Observe`, `Changed`, arithmetic, container mutations, and timed helpers.
+  </Card>
+  <Card title="Types" icon="file-code" href="/api/types">
+    All exported option tables, result shapes, enums, and named string unions used across the other four modules.
+  </Card>
+</CardGroup>
+
+## Badge conventions
+
+Every method listing carries one or more badges that tell you where and how to call it.
+
+<CardGroup cols={2}>
+  <Card title="server" icon="server">
+    Call this only from a `Script` running on the server. Calling it from a `LocalScript` will error.
+  </Card>
+  <Card title="client" icon="monitor">
+    Call this only from a `LocalScript`. Calling it from a `Script` will error.
+  </Card>
+  <Card title="yields" icon="clock">
+    The calling thread may suspend before this function returns. Do not call it inside a non-yielding callback such as a `Changed` listener.
+  </Card>
+</CardGroup>
+
+## Reading signatures
+
+Scribe follows standard Luau annotation conventions throughout.
+
+- A bare type such as `player: Player` is required.
+- A trailing `?` such as `timeout: number?` marks an optional parameter — you may omit it or pass `nil`.
+- Multiple return values are written as a tuple: `(boolean, string?)` means the first return is always a boolean and the second is an optional string.
+- Generic type parameters appear as `<T>` and are usually inferred from context.
+
+<Tip>
+  Read the **return description** alongside the return type. A `boolean` return can mean different things for different methods — for example, `false` from `Server.Flush` does not mean the data was lost, only that confirmation did not arrive in time.
+</Tip>
+
+## Naming conventions across the reference
+
+The reference uses these conventions consistently:
+
+- `PlayerData<T>` refers to the typed accessor tree returned by `Server.Get(player)`, `Server.WaitForData(player)`, and `Client.Get()`. Its field methods are documented on the [Value](/api/value) page.
+- A `Disconnect` return is a zero-argument function. Call it to unsubscribe the listener.
+- A `Signal` exposes `Connect`, `Once`, and `Wait`. Connections return a `Connection` object with a `Disconnect` method.
+- Optional parameters with a `?` suffix have documented defaults where a default exists; omitting one is always safe.
+
+## Navigation quick-reference
+
+| You want to… | Go to |
+|---|---|
+| Declare a new field type | [Scribe — Field Declarators](/api/scribe) |
+| Build a data bundle | [Scribe — Constructor](/api/scribe) |
+| Load a player's data safely on join | [Server — WaitForData](/api/server) |
+| Write multiple fields at once | [Server — Batch](/api/server) |
+| Atomically debit and grant currency | [Server — Transaction](/api/server) |
+| Register a command clients can call | [Server — Command](/api/server) |
+| Save data before a critical operation | [Server — Flush](/api/server) |
+| Read a player's data in a LocalScript | [Client — Get / WaitForData](/api/client) |
+| Call a server command from the client | [Client — Request](/api/client) |
+| Read a field and react to changes | [Value — Get / Observe / Changed](/api/value) |
+| Understand a type signature | [Types](/api/types) |

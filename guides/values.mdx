@@ -1,0 +1,234 @@
+---
+title: "Reading and Writing Data Values in Scribe"
+sidebarTitle: "Values"
+description: "Learn how to read, write, observe, and transform player data fields in Scribe using Get, Set, Update, Observe, Changed, and batch operations."
+---
+
+Every field in your Scribe template becomes a typed **accessor** on the `data` tree returned by `WaitForData` on the server, or exposed directly on the `Client` module on the client. Accessors are not plain tables — they carry named methods that validate your writes, replicate changes to the owning client, and fire listeners on every side that cares. This guide walks through every operation a field supports, from the two you will use constantly to the handful that only apply to a specific kind of field.
+
+## Get and Set
+
+The two methods that cover most of what you will ever write. `Get` reads the current value; `Set` stores a new one and returns what was actually saved — which is not always the value you passed when a `Min` or `Max` constraint is in play.
+
+```lua
+-- server (inside PlayerAdded, after WaitForData)
+local data, reason = Data.WaitForData(player)
+if not data then return end
+
+data.Coins.Get()          --> 0
+data.Coins.Set(100)       --> 100
+data.Coins.Set(-10)       --> 0  (clamped to Min = 0)
+```
+
+Every `Set` call validates the value against the field's declarator, replicates the result to the owning client, and fires any registered listeners.
+
+<Note>
+  On the server, `data` comes from `Data.WaitForData(player)`. On the client, the accessor tree is the `Client` module itself — `Data.Coins.Get()` with no player argument, because the client only ever sees its own data.
+</Note>
+
+## Observe and Changed
+
+Both methods register a callback that fires when the field value changes. The difference is timing: `Observe` calls your callback immediately with the current value **and** on every subsequent change, while `Changed` skips that first call and fires only on transitions.
+
+```lua
+-- client
+local stop = Data.Coins.Observe(function(coins)
+    -- fires immediately with the current value, then on every change
+    coinsLabel.Text = tostring(coins)
+end)
+
+Data.Level.Changed(function(new, old)
+    -- fires only when the value actually changes
+    if new > old then
+        playLevelUpEffect(new)
+    end
+end)
+```
+
+Both return a **disconnect function**. Call it to stop receiving updates.
+
+<Tip>
+  Use `Observe` for UI elements that need to display a value from the first frame. Use `Changed` when you only care about the transition itself, such as triggering a sound or awarding a bonus.
+</Tip>
+
+## Update
+
+`Update` reads the current value, passes it to your function, and stores whatever you return. It saves you the manual read-then-write pattern and keeps both halves of the operation next to each other.
+
+```lua
+-- round a coin balance down to the nearest ten
+data.Coins.Update(function(current)
+    return current - (current % 10)
+end)
+```
+
+<Warning>
+  The value passed to your `Update` function is the same reference `Get` would return. For ordinary table fields, mutating it in place bypasses validation, replication, and `Changed`. Build and return a new table instead of editing the one you received.
+
+  ```lua
+  -- WRONG: edits stored state silently
+  data.Inventory.Update(function(current)
+      current.Emberblade = { Qty = 1, Rarity = "Legendary" }
+      return current
+  end)
+
+  -- RIGHT: build a fresh table and return it
+  data.Inventory.Update(function(current)
+      local updated = table.clone(current)
+      updated.Emberblade = { Qty = 1, Rarity = "Legendary" }
+      return updated
+  end)
+  ```
+</Warning>
+
+## Clone and Default
+
+`Clone` returns a deep copy of the current value that you can freely mutate without affecting the stored data. `Default` returns the field's declared default value from the template without touching the stored value at all — it works even before any data has loaded.
+
+```lua
+-- take a local snapshot to inspect; nothing is written back
+local snapshot = data.Inventory.Clone()
+
+-- reset settings to whatever the template declared
+data.Settings.Set(data.Settings.Default())
+```
+
+`Default` is read-only schema metadata, so it is safe to call on the client and before `WaitForData` returns. It is the correct way to build a "reset to defaults" button or to check whether a player has ever changed a setting.
+
+## Numbers: Increment, Decrement, Min, Max
+
+Number fields expose four additional methods beyond the common surface.
+
+| Method | What it does |
+|---|---|
+| `Increment(amount, meta?)` | Adds `amount` and returns the new value |
+| `Decrement(amount, meta?)` | Subtracts `amount` and returns the new value |
+| `Min()` | The declared minimum, or `nil` if unbounded |
+| `Max()` | The declared maximum, or `nil` if unbounded |
+
+```lua
+data.Coins.Get()              --> 0
+data.Coins.Set(100)           --> 100
+data.Coins.Increment(50)      --> 150
+data.Coins.Decrement(25)      --> 125
+
+-- drive a progress bar from schema metadata
+levelBar.Size = UDim2.fromScale(Data.Level.Get() / Data.Level.Max(), 1)
+```
+
+The optional second argument to `Increment` and `Decrement` is an economy-analytics metadata table. Pass one and Scribe emits a Roblox economy event for that write:
+
+```lua
+data.Coins.Increment(500, {
+    TransactionType = Enum.AnalyticsEconomyTransactionType.IAP,
+    ItemSku = "CoinPack500",
+})
+```
+
+## Booleans: Toggle
+
+A plain boolean field has one extra method: `Toggle`, which flips the current value and returns the new state.
+
+```lua
+data.MusicEnabled.Toggle()   --> false (was true)
+data.MusicEnabled.Toggle()   --> true
+```
+
+## The `silent` Parameter
+
+Most mutators accept a trailing `replicate` boolean. Pass `false` and the write happens on the server, persists normally, and is simply not sent to the client. Reach for it on fields that change very often and that no client UI reads.
+
+```lua
+-- increment playtime without sending a diff on every heartbeat
+data.Stats.Playtime.Increment(60, false)
+```
+
+<Note>
+  If the client should **never** see a field at all, declare it with `Scribe.ServerOnly` in your template rather than passing `false` on every write. `ServerOnly` is a statement about the field; `false` is a statement about one write.
+</Note>
+
+## Batch
+
+`Data.Batch(player, fn)` on the server coalesces every write inside `fn` into a single replication frame. Container `Changed` listeners fire once for the whole batch rather than once per write.
+
+```lua
+Data.Batch(player, function()
+    data.Index.Set(i + 1)
+    data.StartedAt.Set(0)
+    data.Current.Set(nextZone)
+end)
+-- data.Changed fires ONCE with the end state
+```
+
+On the client, `Data.Batch(fn)` does the same for local writes — useful when a UI update touches several fields and you want `Changed` to fire once.
+
+```lua
+-- client
+Data.Batch(function()
+    Data.Equipped.Set("Sword")
+    Data.Inventory.Sword.Qty.Decrement(1)
+end)
+```
+
+## Container Listeners
+
+Container fields — anything declared with `DictOf`, `ArrayOf`, `MapOf`, `SetOf`, or `Flags` — support three additional listener methods beyond `Changed`.
+
+| Listener | Callback signature | Answers |
+|---|---|---|
+| `Changed(fn)` | `(new, old)` | Something beneath this changed; here is the current state |
+| `OnChildChanged(fn)` | `(key, new, old)` | Which direct child moved, and from what to what |
+| `OnKeyAdded(fn)` / `OnKeyRemoved(fn)` | `(key, value)` | A key appeared or disappeared |
+
+```lua
+data.Inventory.Changed(function(inventory)
+    redrawTotalWeight(inventory)   -- fires once per batch
+end)
+
+data.Inventory.OnChildChanged(function(itemId, new, old)
+    refreshSlot(itemId, new)       -- fires once per write
+end)
+
+data.Inventory.OnKeyRemoved(function(itemId, lastValue)
+    destroySlot(itemId)
+end)
+```
+
+`Changed` on a container is coalesced: a `Batch` writing four entries fires it once. `OnChildChanged` is never coalesced, so three writes fire it three times.
+
+## The Whole Surface at a Glance
+
+<Accordion title="Method reference by field type">
+
+| Method | Applies to |
+|---|---|
+| `Get`, `Set`, `Update`, `Clone`, `Default`, `Observe`, `Changed` | Every field |
+| `Increment`, `Decrement`, `Min`, `Max` | Numbers, including `Scribe.Big` |
+| `Multiply`, `Divide` | `Scribe.Big` only |
+| `Toggle` | Booleans, and `Scribe.Flags` with a member name |
+| `Enable`, `Disable`, `Has`, `Clear` | `Scribe.Flags` |
+| `Add`, `Remove`, `Has`, `Count`, `Clear` | `Scribe.SetOf` |
+| `Insert`, `Remove`, `RemoveValue`, `Find`, `Has`, `Count`, `Clear` | Arrays and dictionaries |
+| `OnInsert`, `OnRemove`, `OnKeyAdded`, `OnKeyRemoved`, `OnChildChanged` | Containers |
+| `SetTimed`, `ExtendTimed`, `Active` | `Scribe.Timed` |
+
+Calling a method on the wrong field type is an error that names the field and method — not a silent no-op.
+
+</Accordion>
+
+## Where to Next
+
+<CardGroup cols={2}>
+  <Card title="Templates" icon="code" href="/guides/templates">
+    Declare the fields that become these accessors.
+  </Card>
+  <Card title="Containers" icon="box" href="/guides/containers">
+    ArrayOf, DictOf, MapOf, SetOf, and Flags in detail.
+  </Card>
+  <Card title="Replication" icon="arrows-rotate" href="/guides/replication">
+    How writes travel from server to client automatically.
+  </Card>
+  <Card title="Lifecycle" icon="clock" href="/guides/lifecycle">
+    Waiting for data to load before reading or writing.
+  </Card>
+</CardGroup>
